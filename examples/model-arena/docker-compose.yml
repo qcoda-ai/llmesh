@@ -1,0 +1,65 @@
+# Model Arena + LLMesh Hub + Postgres
+#
+# Start everything:
+#   docker compose up
+#
+# Then start LLMesh agents on your machines:
+#   LLMESH_API_KEY="arena-demo-key" HUB_URL="http://<hub-ip>:8000" python -m lib.agent.client
+#
+# Open http://localhost:5000 to use the Arena.
+
+services:
+
+  # ── Postgres: session persistence ────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: llmesh
+      POSTGRES_USER: llmesh
+      POSTGRES_PASSWORD: llmesh
+    volumes:
+      - llmesh_pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmesh -d llmesh"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── LLMesh Hub: the inference broker ("nginx" layer) ─────────────────────
+  hub:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./server_config.json:/app/server_config.json:ro
+      - llmesh_data:/data
+      - llmesh_hf_cache:/home/appuser/.cache/huggingface
+    environment:
+      SESSION_BACKEND: postgres
+      DATABASE_URL: postgresql://llmesh:llmesh@postgres:5432/llmesh
+    restart: unless-stopped
+
+  # ── Model Arena: the example app ─────────────────────────────────────────
+  arena:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    depends_on:
+      - hub
+    environment:
+      LLMESH_HUB_URL: http://hub:8000
+      LLMESH_API_KEY: arena-demo-key
+    restart: unless-stopped
+
+volumes:
+  llmesh_pg:
+  llmesh_data:
+  llmesh_hf_cache:

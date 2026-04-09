@@ -1,0 +1,25 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+
+# Database files — use the Docker volume instead
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets — never bake into the image
+.env
+server_config.json
+api_keys.json
+
+# Not needed in the image
+tasks/
+docs/
+tests/
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.env.example

@@ -1,0 +1,21 @@
+{
+    "api_keys": {
+        "change-me-key-1": "owner_alpha",
+        "change-me-key-2": "owner_beta"
+    },
+    "session": {
+        "backend": "sqlite",
+        "db": "./sessions.db",
+        "ttl_seconds": 7200,
+        "max_turns": 20,
+        "memory_mode": "aggressive"
+    },
+    "compress": {
+        "model_repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "model_file": "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    },
+    "metrics": {
+        "retention_days_events": 30,
+        "retention_days_snapshots": 7
+    }
+}

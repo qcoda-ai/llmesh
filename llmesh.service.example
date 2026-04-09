@@ -1,0 +1,35 @@
+# LLMesh Hub — systemd unit (template)
+#
+# Rename this file to `llmesh.service` and adjust the WorkingDirectory and
+# port to match your deployment. The real `llmesh.service` is gitignored —
+# do not commit it. See decisions.md D016 for the full pattern.
+#
+# Install:
+#   sudo cp llmesh.service /etc/systemd/system/llmesh.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now llmesh
+#   journalctl -u llmesh -f
+
+[Unit]
+Description=LLMesh Hub
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/llmesh
+Environment="PATH=/opt/llmesh/.venv/bin"
+
+# Force unbuffered Python stdio so hub `print()` diagnostics reach journalctl
+# immediately. uvicorn handles its own access logging but the hub code uses
+# `print()` for startup, registration, and error messages. See decisions.md D017.
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/opt/llmesh/.venv/bin/uvicorn lib.hub.server:app --port 5109 --host 0.0.0.0
+ExecReload=/bin/kill -HUP ${MAINPID}
+RestartSec=30
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

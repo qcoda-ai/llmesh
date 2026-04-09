@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Model Arena — LLMesh</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: #0a0e17;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        .header {
+            padding: 1.5rem 2rem;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .header h1 span {
+            color: #00d4ff;
+        }
+
+        .header .hub-status {
+            font-size: 0.8rem;
+            color: rgba(255,255,255,0.4);
+        }
+
+        .hub-status .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            background: #444;
+        }
+
+        .hub-status .dot.connected { background: #22c55e; }
+        .hub-status .dot.error { background: #ef4444; }
+
+        .controls {
+            padding: 1.5rem 2rem;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .model-row {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .model-select-group {
+            flex: 1;
+        }
+
+        .model-select-group label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: rgba(255,255,255,0.5);
+            margin-bottom: 0.4rem;
+        }
+
+        .model-select-group.side-a label { color: #00d4ff; }
+        .model-select-group.side-b label { color: #a78bfa; }
+
+        select {
+            width: 100%;
+            padding: 0.6rem 0.8rem;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 6px;
+            color: #fff;
+            font-size: 0.9rem;
+            appearance: none;
+            cursor: pointer;
+        }
+
+        select:focus { outline: none; border-color: #00d4ff; }
+
+        .prompt-row {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        textarea {
+            flex: 1;
+            padding: 0.7rem 1rem;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 6px;
+            color: #fff;
+            font-size: 0.9rem;
+            resize: none;
+            height: 44px;
+            line-height: 1.5;
+            font-family: inherit;
+        }
+
+        textarea:focus { outline: none; border-color: #00d4ff; }
+
+        .btn-run {
+            padding: 0 1.5rem;
+            background: #00d4ff;
+            color: #0a0e17;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .btn-run:hover { background: #00bde0; }
+        .btn-run:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+        .arena {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .arena-side {
+            padding: 1.5rem 2rem;
+            display: flex;
+            flex-direction: column;
+            min-height: 300px;
+        }
+
+        .arena-side.side-a {
+            border-right: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .arena-side-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .arena-side-header h2 {
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .side-a .arena-side-header h2 { color: #00d4ff; }
+        .side-b .arena-side-header h2 { color: #a78bfa; }
+
+        .arena-stats {
+            font-size: 0.75rem;
+            color: rgba(255,255,255,0.35);
+            display: flex;
+            gap: 1rem;
+        }
+
+        .arena-stats span { white-space: nowrap; }
+
+        .arena-output {
+            flex: 1;
+            font-size: 0.9rem;
+            line-height: 1.7;
+            color: rgba(255,255,255,0.8);
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-y: auto;
+        }
+
+        .arena-output .cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1em;
+            background: currentColor;
+            animation: blink 0.8s step-end infinite;
+            vertical-align: text-bottom;
+            margin-left: 1px;
+        }
+
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+
+        .arena-output .error {
+            color: #ef4444;
+            font-style: italic;
+        }
+
+        .empty-state {
+            color: rgba(255,255,255,0.2);
+            font-style: italic;
+            margin-top: 2rem;
+            text-align: center;
+        }
+
+        .winner-badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-left: 0.5rem;
+        }
+
+        .winner-badge.faster { background: rgba(34,197,94,0.15); color: #22c55e; }
+        .winner-badge.fewer-tokens { background: rgba(250,204,21,0.15); color: #facc15; }
+
+        .history {
+            padding: 1.5rem 2rem;
+            border-top: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .history h3 {
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: rgba(255,255,255,0.4);
+            margin-bottom: 0.75rem;
+        }
+
+        .history-table {
+            width: 100%;
+            font-size: 0.8rem;
+            border-collapse: collapse;
+        }
+
+        .history-table th {
+            text-align: left;
+            padding: 0.4rem 0.75rem;
+            color: rgba(255,255,255,0.35);
+            font-weight: 500;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .history-table td {
+            padding: 0.4rem 0.75rem;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            color: rgba(255,255,255,0.6);
+        }
+
+        .history-table tr:last-child td { border-bottom: none; }
+
+        .tag-a { color: #00d4ff; }
+        .tag-b { color: #a78bfa; }
+
+        @media (max-width: 768px) {
+            .arena { grid-template-columns: 1fr; }
+            .arena-side.side-a { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.06); }
+            .model-row { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1><span>Model Arena</span> &mdash; LLMesh</h1>
+    <div class="hub-status">
+        <span class="dot" id="hubDot"></span>
+        <span id="hubLabel">Connecting...</span>
+    </div>
+</div>
+
+<div class="controls">
+    <div class="model-row">
+        <div class="model-select-group side-a">
+            <label>Model A</label>
+            <select id="modelA"><option>Loading models...</option></select>
+        </div>
+        <div class="model-select-group side-b">
+            <label>Model B</label>
+            <select id="modelB"><option>Loading models...</option></select>
+        </div>
+    </div>
+    <div class="prompt-row">
+        <textarea id="prompt" placeholder="Enter a prompt to test both models..." rows="1"></textarea>
+        <button class="btn-run" id="runBtn" disabled>Run Arena</button>
+    </div>
+</div>
+
+<div class="arena">
+    <div class="arena-side side-a">
+        <div class="arena-side-header">
+            <h2 id="labelA">Model A</h2>
+            <div class="arena-stats" id="statsA"></div>
+        </div>
+        <div class="arena-output" id="outputA">
+            <div class="empty-state">Waiting for prompt...</div>
+        </div>
+    </div>
+    <div class="arena-side side-b">
+        <div class="arena-side-header">
+            <h2 id="labelB">Model B</h2>
+            <div class="arena-stats" id="statsB"></div>
+        </div>
+        <div class="arena-output" id="outputB">
+            <div class="empty-state">Waiting for prompt...</div>
+        </div>
+    </div>
+</div>
+
+<div class="history" id="historySection" style="display:none">
+    <h3>Round History</h3>
+    <table class="history-table">
+        <thead>
+            <tr>
+                <th>Prompt</th>
+                <th>Model A</th>
+                <th>Model B</th>
+                <th>Latency A</th>
+                <th>Latency B</th>
+                <th>Tokens A</th>
+                <th>Tokens B</th>
+                <th>Faster</th>
+            </tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+    </table>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let running = false;
+const history = [];
+
+// Check hub connectivity
+async function checkHub() {
+    try {
+        const resp = await fetch('/api/health');
+        const data = await resp.json();
+        const ok = data.hub && data.hub.status === 'ok';
+        $('hubDot').className = 'dot ' + (ok ? 'connected' : 'error');
+        $('hubLabel').textContent = ok ? data.hub_url : 'Hub unreachable';
+        return ok;
+    } catch {
+        $('hubDot').className = 'dot error';
+        $('hubLabel').textContent = 'Arena API error';
+        return false;
+    }
+}
+
+// Load models from hub
+async function loadModels() {
+    try {
+        const resp = await fetch('/api/models');
+        const data = await resp.json();
+        const models = data.models || [];
+        if (models.length === 0) {
+            const msg = data.error || 'No models available';
+            [$('modelA'), $('modelB')].forEach(sel => {
+                sel.innerHTML = `<option>${msg}</option>`;
+            });
+            return;
+        }
+        [$('modelA'), $('modelB')].forEach((sel, i) => {
+            sel.innerHTML = models.map((m, j) =>
+                `<option value="${m}" ${j === (i % models.length) ? '' : j === ((i + 1) % models.length) ? 'selected' : ''}>${m}</option>`
+            ).join('');
+            // Pre-select different models if possible
+            if (models.length > 1) {
+                sel.selectedIndex = i === 0 ? 0 : 1;
+            }
+        });
+        $('runBtn').disabled = false;
+    } catch {
+        [$('modelA'), $('modelB')].forEach(sel => {
+            sel.innerHTML = '<option>Failed to load models</option>';
+        });
+    }
+}
+
+// Run the arena
+async function runArena() {
+    const prompt = $('prompt').value.trim();
+    if (!prompt || running) return;
+
+    const modelA = $('modelA').value;
+    const modelB = $('modelB').value;
+
+    running = true;
+    $('runBtn').disabled = true;
+    $('runBtn').textContent = 'Running...';
+    $('labelA').textContent = modelA;
+    $('labelB').textContent = modelB;
+    $('outputA').innerHTML = '<span class="cursor"></span>';
+    $('outputB').innerHTML = '<span class="cursor"></span>';
+    $('statsA').innerHTML = '';
+    $('statsB').innerHTML = '';
+
+    const textA = { content: '', el: $('outputA') };
+    const textB = { content: '', el: $('outputB') };
+    const results = {};
+
+    try {
+        const resp = await fetch('/api/arena', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, model_a: modelA, model_b: modelB }),
+        });
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const event = JSON.parse(line.slice(6));
+                    const target = event.side === 'a' ? textA : textB;
+
+                    if (event.type === 'token') {
+                        target.content += event.content;
+                        target.el.innerHTML = target.content + '<span class="cursor"></span>';
+                        target.el.scrollTop = target.el.scrollHeight;
+                    } else if (event.type === 'done') {
+                        target.el.innerHTML = target.content;
+                        results[event.side] = event;
+                        const statsEl = event.side === 'a' ? $('statsA') : $('statsB');
+                        statsEl.innerHTML = `<span>${event.elapsed_ms}ms</span><span>${event.completion_tokens} tokens</span>`;
+                    } else if (event.type === 'error') {
+                        target.el.innerHTML = `<span class="error">${event.message}</span>`;
+                    }
+                } catch {}
+            }
+        }
+    } catch (e) {
+        $('outputA').innerHTML = `<span class="error">Connection error: ${e.message}</span>`;
+    }
+
+    // Show winner badges
+    if (results.a && results.b) {
+        if (results.a.elapsed_ms < results.b.elapsed_ms) {
+            $('labelA').innerHTML = modelA + ' <span class="winner-badge faster">Faster</span>';
+        } else if (results.b.elapsed_ms < results.a.elapsed_ms) {
+            $('labelB').innerHTML = modelB + ' <span class="winner-badge faster">Faster</span>';
+        }
+
+        // Add to history
+        const shorter = prompt.length > 60 ? prompt.slice(0, 57) + '...' : prompt;
+        const faster = results.a.elapsed_ms <= results.b.elapsed_ms ? 'A' : 'B';
+        history.unshift({
+            prompt: shorter, modelA, modelB,
+            latA: results.a.elapsed_ms, latB: results.b.elapsed_ms,
+            tokA: results.a.completion_tokens, tokB: results.b.completion_tokens,
+            faster,
+        });
+        renderHistory();
+    }
+
+    running = false;
+    $('runBtn').disabled = false;
+    $('runBtn').textContent = 'Run Arena';
+}
+
+function renderHistory() {
+    if (history.length === 0) return;
+    $('historySection').style.display = 'block';
+    $('historyBody').innerHTML = history.map(h => `
+        <tr>
+            <td>${escapeHtml(h.prompt)}</td>
+            <td class="tag-a">${h.modelA}</td>
+            <td class="tag-b">${h.modelB}</td>
+            <td>${h.latA}ms</td>
+            <td>${h.latB}ms</td>
+            <td>${h.tokA}</td>
+            <td>${h.tokB}</td>
+            <td>${h.faster === 'A' ? '<span class="tag-a">A</span>' : '<span class="tag-b">B</span>'}</td>
+        </tr>
+    `).join('');
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+// Auto-resize textarea
+$('prompt').addEventListener('input', function() {
+    this.style.height = '44px';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// Enter to run (shift+enter for newline)
+$('prompt').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        runArena();
+    }
+});
+
+$('runBtn').addEventListener('click', runArena);
+
+// Init
+checkHub().then(loadModels);
+</script>
+
+</body>
+</html>

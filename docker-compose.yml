@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - llmesh_pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hub:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # API keys and session config — copy server_config.example.json to server_config.json and edit
+      - ./server_config.json:/app/server_config.json:ro
+      # SQLite file for inference metrics (always local, regardless of session backend)
+      - llmesh_data:/data
+      # HuggingFace model cache — only used when SESSION_MEMORY_MODE != cutoff
+      - llmesh_hf_cache:/home/appuser/.cache/huggingface
+    env_file:
+      - .env
+    environment:
+      # Docker default: Postgres for session persistence across hub restarts.
+      # These override any SESSION_BACKEND / DATABASE_URL set in .env.
+      # For bare-metal / local dev, omit Docker and use .env directly — SQLite is the default.
+      SESSION_BACKEND: postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    # Rate limiting defaults (override via .env or additional environment entries above).
+    # See .env.example for all available RATE_LIMIT_* variables.
+    # To use Redis for shared rate limit state across multiple hub instances:
+    #   environment:
+    #     RATE_LIMIT_STORAGE_URL: redis://redis:6379
+    restart: unless-stopped
+
+volumes:
+  llmesh_pg:
+  llmesh_data:
+  llmesh_hf_cache:

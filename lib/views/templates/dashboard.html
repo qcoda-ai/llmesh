@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLMesh Admin Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .chart-container { position: relative; height: 240px; }
+        .tab-content { padding-top: 1.25rem; }
+        .table-sm td, .table-sm th { font-size: 0.82rem; }
+        .monospace { font-family: var(--bs-font-monospace); }
+        .node-card .node-summary { cursor: pointer; user-select: none; }
+        .node-card .node-summary:hover { background: #f0f4ff; }
+        .node-card .backend-row { font-size: 0.82rem; }
+        .node-card .model-pill { font-size: 0.72rem; background: #e9ecef; border-radius: 3px; padding: 1px 5px; margin: 1px; display: inline-block; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+        .status-dot.online  { background: #198754; }
+        .status-dot.offline { background: #dc3545; }
+        .status-dot.stale   { background: #ffc107; }
+    </style>
+</head>
+<body class="bg-light">
+<div class="container-fluid mt-4 px-4">
+
+    <!-- Header -->
+    <div class="d-flex align-items-center mb-3">
+        <h4 class="mb-0 me-3">LLMesh Dashboard</h4>
+        <span class="badge bg-secondary me-auto">{{ owner_id }}</span>
+        <a href="/logout" class="btn btn-sm btn-outline-danger">Logout</a>
+    </div>
+
+    <!-- Tabs -->
+    <ul class="nav nav-tabs" id="dashTabs" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="tab-nodes-btn" data-bs-toggle="tab"
+                    data-bs-target="#tab-nodes" type="button" role="tab">
+                Nodes &amp; Inference
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-stats-btn" data-bs-toggle="tab"
+                    data-bs-target="#tab-stats" type="button" role="tab">
+                Stats
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-recent-btn" data-bs-toggle="tab"
+                    data-bs-target="#tab-recent" type="button" role="tab">
+                Recent Data
+            </button>
+        </li>
+    </ul>
+
+    <div class="tab-content" id="dashTabsContent">
+
+        <!-- ============================== TAB 1: Nodes & Inference ============================== -->
+        <div class="tab-pane fade show active" id="tab-nodes" role="tabpanel">
+            <div class="row g-3">
+
+                <!-- Connected nodes -->
+                <div class="col-lg-8">
+                    <div class="card shadow-sm h-100">
+                        <div class="card-header bg-primary text-white d-flex align-items-center">
+                            <span>Connected Nodes</span>
+                            <span id="node-count-badge" class="badge bg-light text-primary ms-2">0</span>
+                        </div>
+                        <div class="card-body p-2">
+                            <div id="node-list" class="accordion accordion-flush">
+                                <div class="text-center text-muted py-3">Loading…</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Inference form + API info -->
+                <div class="col-lg-4">
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header bg-dark text-white">Request AI Inference</div>
+                        <div class="card-body">
+                            <form action="/dashboard/request_inference" method="post">
+                                <div class="mb-3">
+                                    <label for="model" class="form-label">Model</label>
+                                    <select class="form-select form-select-sm" id="model" name="model" required>
+                                        {% if available_models %}
+                                            {% for model in available_models %}
+                                            <option value="{{ model.name }}">{{ model.name }} ({{ model.count }})</option>
+                                            {% endfor %}
+                                        {% else %}
+                                            <option value="" disabled selected>No models available online</option>
+                                        {% endif %}
+                                    </select>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="prompt" class="form-label">Prompt</label>
+                                    <textarea class="form-control form-control-sm" id="prompt" name="prompt"
+                                              rows="4" placeholder="e.g. Translate hello to Spanish" required></textarea>
+                                </div>
+                                <button type="submit" id="submitBtn" class="btn btn-primary btn-sm w-100"
+                                        {% if not available_models %}disabled{% endif %}>
+                                    Send to Mesh
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-info text-white">API Endpoints</div>
+                        <div class="card-body">
+                            <p class="small text-muted mb-2">Point any OpenAI- or Anthropic-compatible client at this hub.</p>
+                            <div class="mb-3">
+                                <div class="form-label fw-semibold small mb-1">OpenAI Compatible</div>
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text bg-light text-muted">POST</span>
+                                    <input type="text" class="form-control font-monospace text-muted"
+                                           value="{{ base_url }}/v1/chat/completions" readonly onclick="this.select();">
+                                </div>
+                                <small class="text-muted">Header: <code>Authorization: Bearer &lt;key&gt;</code></small>
+                            </div>
+                            <div>
+                                <div class="form-label fw-semibold small mb-1">Anthropic Compatible</div>
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text bg-light text-muted">POST</span>
+                                    <input type="text" class="form-control font-monospace text-muted"
+                                           value="{{ base_url }}/v1/messages" readonly onclick="this.select();">
+                                </div>
+                                <small class="text-muted">Header: <code>x-api-key: &lt;key&gt;</code></small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div><!-- /row -->
+        </div><!-- /tab-nodes -->
+
+        <!-- ============================== TAB 2: Stats ============================== -->
+        <div class="tab-pane fade" id="tab-stats" role="tabpanel">
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Inference Activity (calls / 5-min bucket)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartActivity"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Active Nodes Over Time</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartNodes"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Token Usage</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartTokens"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Response Speed (ms/token)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartSpeed"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Task Status (Success / Fail)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartStatus"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Model Usage</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartModels"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Compression charts -->
+                <div class="col-12"><hr class="my-1"><p class="text-muted small mb-0 ms-1">Session Memory &amp; Compression</p></div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">User Calls vs Compression Calls</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartCallTypes"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Compression Token Cost</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartCompressTokens"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Active Sessions &amp; Avg Message Depth</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartSessions"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Node performance charts -->
+                <div class="col-12"><hr class="my-1"><p class="text-muted small mb-0 ms-1">Per-Node Performance</p></div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Node Task Throughput (tasks / 5-min)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartNodeThroughput"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Node Avg Latency (ms / 5-min)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartNodeLatency"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Node Success Rate (% / 5-min)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartNodeSuccess"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">Node Task Distribution (all-time)</div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartNodeDist"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div><!-- /tab-stats -->
+
+        <!-- ============================== TAB 3: Recent Data ============================== -->
+        <div class="tab-pane fade" id="tab-recent" role="tabpanel">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <span class="text-muted small">Most recent 10 rows per table &mdash; auto-refreshes on tab open.</span>
+                <button class="btn btn-sm btn-outline-secondary" onclick="fetchRecent()">Refresh</button>
+            </div>
+
+            <div class="card shadow-sm mb-3">
+                <div class="card-header bg-dark text-white">inference_events</div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped table-hover mb-0" id="tbl-inference">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>ID</th><th>Time</th><th>User</th><th>Node</th>
+                                    <th>Model</th><th>Status</th><th>ms</th>
+                                    <th>Prompt tok</th><th>Completion tok</th>
+                                </tr>
+                            </thead>
+                            <tbody><tr><td colspan="9" class="text-center text-muted py-2">Loading…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card shadow-sm mb-3">
+                <div class="card-header bg-dark text-white">node_snapshots</div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped table-hover mb-0" id="tbl-snapshots">
+                            <thead class="table-light">
+                                <tr><th>ID</th><th>Time</th><th>User</th><th>Active Nodes</th></tr>
+                            </thead>
+                            <tbody><tr><td colspan="4" class="text-center text-muted py-2">Loading…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card shadow-sm mb-3">
+                <div class="card-header bg-dark text-white">sessions</div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped table-hover mb-0" id="tbl-sessions">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>Session ID</th><th>Owner</th><th>Messages</th>
+                                    <th>Created</th><th>Last Active</th>
+                                </tr>
+                            </thead>
+                            <tbody><tr><td colspan="5" class="text-center text-muted py-2">Loading…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div><!-- /tab-recent -->
+
+    </div><!-- /tab-content -->
+</div><!-- /container -->
+
+<footer style="margin-top:1.5rem;padding:6px 16px;border-top:1px solid #dee2e6;font-size:0.72rem;color:#868e96;display:flex;align-items:center;gap:1rem;justify-content:center;">
+    <span>LLMesh v{{ version }}</span>
+    <span style="color:#dee2e6;">|</span>
+    <a href="https://github.com/andrew_schwabe/qcoda-nodemesh/blob/main/LICENSE" style="color:#868e96;text-decoration:none;">MIT License</a>
+    <span style="color:#dee2e6;">|</span>
+    <a href="https://github.com/andrew_schwabe/qcoda-nodemesh" style="color:#868e96;text-decoration:none;">GitHub</a>
+    <span style="color:#dee2e6;">|</span>
+    <a href="https://github.com/andrew_schwabe/qcoda-nodemesh#readme" style="color:#868e96;text-decoration:none;">Docs</a>
+    <span style="color:#dee2e6;">|</span>
+    <a href="https://llmesh-website.pages.dev" style="color:#868e96;text-decoration:none;">llmesh.net</a>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// ───────── HTML escape helper (XSS guard for node/client-controlled strings) ─────────
+function esc(v) {
+    if (v === null || v === undefined) return '';
+    return String(v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// ───────── Node table ─────────
+let currentNodes = [];
+let nodeRatings = {};
+
+async function fetchNodes() {
+    try {
+        const data = await fetch('/api/nodes').then(r => r.json());
+        updateNodeTable(data);
+        updateModelDropdown(data);
+    } catch (e) { console.error('fetchNodes', e); }
+}
+
+function updateModelDropdown(nodes) {
+    const sel = document.getElementById('model');
+    const prev = sel.value;
+    let counts = {};
+    nodes.forEach(n => {
+        if (n.last_seen_sec >= 30) return;
+        const allModels = [
+            ...(n.ollama_available ? (n.ollama_models || []) : []),
+            ...(n.vllm_available   ? (n.vllm_models   || []) : []),
+            ...(n.mlx_available    ? (n.mlx_models    || []) : []),
+        ];
+        allModels.forEach(m => counts[m] = (counts[m] || 0) + 1);
+    });
+    const sorted = Object.entries(counts).map(([name, count]) => ({name, count}))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    const btn = document.getElementById('submitBtn');
+    if (!sorted.length) {
+        sel.innerHTML = '<option value="" disabled selected>No models available online</option>';
+        btn.disabled = true;
+    } else {
+        let found = false;
+        sel.innerHTML = sorted.map(({name, count}) => {
+            const sel2 = name === prev ? (found = true, 'selected') : '';
+            return `<option value="${esc(name)}" ${sel2}>${esc(name)} (${count})</option>`;
+        }).join('');
+        if (!found) sel.options[0].selected = true;
+        btn.disabled = false;
+    }
+}
+
+function backendRow(label, available, models) {
+    if (!available && !(models && models.length)) return '';
+    const dot = available
+        ? '<span class="status-dot online me-1"></span>'
+        : '<span class="status-dot offline me-1"></span>';
+    const pills = (models || []).map(m => `<span class="model-pill">${esc(m)}</span>`).join('');
+    return `
+        <div class="backend-row d-flex align-items-start gap-2 mb-1">
+            <span class="text-muted" style="min-width:52px">${dot}${label}</span>
+            <div>${pills || '<span class="text-muted" style="font-size:0.75rem">no models</span>'}</div>
+        </div>`;
+}
+
+function updateNodeTable(nodes) {
+    currentNodes = nodes;
+    const container = document.getElementById('node-list');
+    document.getElementById('node-count-badge').textContent = nodes.length;
+    if (!nodes.length) {
+        container.innerHTML = '<div class="text-center text-muted py-3">No nodes connected.</div>';
+        return;
+    }
+    container.innerHTML = nodes.map((n, idx) => {
+        const r = nodeRatings[n.node_id_full] || {};
+        const stale = n.last_seen_sec >= 30;
+        const anyUp = n.ollama_available || n.vllm_available || n.mlx_available;
+        const dotClass = stale ? 'stale' : anyUp ? 'online' : 'offline';
+        const collapseId = `node-collapse-${idx}`;
+
+        const statsRow = [
+            r.total_tasks   != null ? `Tasks: <strong>${r.total_tasks}</strong>` : null,
+            r.success_pct   != null ? `Success: <strong>${r.success_pct}%</strong>` : null,
+            r.avg_latency_ms!= null ? `Avg: <strong>${r.avg_latency_ms} ms</strong>` : null,
+        ].filter(Boolean).join(' &nbsp;·&nbsp; ');
+
+        return `
+        <div class="node-card border-bottom">
+            <div class="node-summary d-flex align-items-center gap-3 px-3 py-2"
+                 data-bs-toggle="collapse" data-bs-target="#${collapseId}">
+                <span class="status-dot ${dotClass}"></span>
+                <span class="monospace text-muted" style="min-width:80px;font-size:0.8rem">${esc(n.node_id)}</span>
+                <span class="badge bg-secondary">${esc(n.os_name)}</span>
+                <span class="text-muted small">${Number(n.cpu_cores) || 0}c&nbsp;/&nbsp;${Number(n.ram_gb) || 0}GB</span>
+                <span class="text-muted small">Ctx&nbsp;${(n.context_size / 1024).toFixed(0)}k</span>
+                <span class="text-muted small">CPU&nbsp;${n.cpu_load.toFixed(1)}%</span>
+                <span class="text-muted small">${Math.round(n.latency_ms || 0)}&thinsp;ms</span>
+                <span class="text-muted small ms-auto">${n.last_seen_sec}s ago</span>
+                <span class="text-muted" style="font-size:0.75rem">&#9660;</span>
+            </div>
+            <div class="collapse" id="${collapseId}">
+                <div class="px-3 pb-2 pt-1 bg-white border-top">
+                    ${backendRow('Ollama', n.ollama_available, n.ollama_models)}
+                    ${backendRow('vLLM',   n.vllm_available,   n.vllm_models)}
+                    ${backendRow('MLX',    n.mlx_available,    n.mlx_models)}
+                    <div class="text-muted mt-2" style="font-size:0.78rem">
+                        Slots: <strong>${n.parallel_slots ?? 1}</strong>&nbsp;·&nbsp;
+                        Context: <strong>${n.context_size ?? 8192}</strong>
+                        ${statsRow ? '&nbsp;·&nbsp;' + statsRow : ''}
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ───────── Charts ─────────
+let charts = {};
+
+const NODE_COLORS = [
+    'rgba(54,162,235,',  'rgba(255,99,132,',  'rgba(75,192,192,',
+    'rgba(255,159,64,',  'rgba(153,102,255,', 'rgba(255,206,86,',
+    'rgba(201,203,207,', 'rgba(255,140,0,',
+];
+function nodeColor(i, alpha) { return NODE_COLORS[i % NODE_COLORS.length] + alpha + ')'; }
+function nodeLineDatasets(pivot, alpha) {
+    return pivot.datasets.map((ds, i) => ({
+        label: ds.node,
+        data: ds.data,
+        borderColor: nodeColor(i, '1'),
+        backgroundColor: nodeColor(i, alpha),
+        fill: false,
+        tension: 0.1,
+        spanGaps: false,
+    }));
+}
+
+function getOrCreate(id, type, data, options) {
+    const ctx = document.getElementById(id).getContext('2d');
+    if (charts[id]) {
+        charts[id].data = data;
+        charts[id].update();
+    } else {
+        charts[id] = new Chart(ctx, {
+            type, data,
+            options: { responsive: true, maintainAspectRatio: false,
+                       interaction: { mode: 'index', intersect: false }, ...options }
+        });
+    }
+}
+
+async function fetchMetrics() {
+    try {
+        const s = await fetch('/api/metrics').then(r => r.json());
+        nodeRatings = s.node_ratings || {};
+        if (currentNodes.length) updateNodeTable(currentNodes);
+
+        getOrCreate('chartActivity', 'bar', {
+            labels: s.timeline.map(i => i.date),
+            datasets: [{ label: 'Total Calls', data: s.timeline.map(i => i.calls), backgroundColor: 'rgba(54,162,235,0.5)' }]
+        });
+
+        getOrCreate('chartNodes', 'line', {
+            labels: s.active_nodes_timeline.map(i => i.time),
+            datasets: [{ label: 'Active Nodes', data: s.active_nodes_timeline.map(i => i.nodes),
+                         borderColor: 'rgba(75,192,192,1)', fill: false, tension: 0.1 }]
+        });
+
+        getOrCreate('chartTokens', 'bar', {
+            labels: s.timeline.map(i => i.date),
+            datasets: [
+                { label: 'Prompt Tokens', data: s.timeline.map(i => i.prompt_tokens), backgroundColor: 'rgba(75,192,192,0.5)' },
+                { label: 'Completion Tokens', data: s.timeline.map(i => i.completion_tokens), backgroundColor: 'rgba(153,102,255,0.5)' }
+            ]
+        }, { scales: { x: { stacked: true }, y: { stacked: true } } });
+
+        getOrCreate('chartSpeed', 'line', {
+            labels: s.timeline.map(i => i.date),
+            datasets: [{ label: 'Speed (ms/token)', data: s.timeline.map(i => i.speed_per_token),
+                         borderColor: 'rgba(255,159,64,1)', fill: false, tension: 0.1 }]
+        });
+
+        getOrCreate('chartStatus', 'bar', {
+            labels: s.timeline.map(i => i.date),
+            datasets: [
+                { label: 'Success', data: s.timeline.map(i => i.success), backgroundColor: 'rgba(75,192,192,0.7)' },
+                { label: 'Fail', data: s.timeline.map(i => i.fail), backgroundColor: 'rgba(255,99,132,0.7)' }
+            ]
+        }, { scales: { x: { stacked: true }, y: { stacked: true } } });
+
+        getOrCreate('chartModels', 'pie', {
+            labels: Object.keys(s.models),
+            datasets: [{ data: Object.values(s.models), backgroundColor: [
+                'rgba(54,162,235,0.7)','rgba(255,99,132,0.7)','rgba(255,206,86,0.7)',
+                'rgba(75,192,192,0.7)','rgba(153,102,255,0.7)','rgba(255,159,64,0.7)'
+            ]}]
+        });
+
+        // --- Compression charts ---
+        // Build a merged label set covering both user and compression buckets
+        const ct = s.compression_timeline || [];
+        const ctMap = Object.fromEntries(ct.map(b => [b.date, b]));
+        // Use user timeline labels as the x-axis; add compression data aligned to same buckets
+        getOrCreate('chartCallTypes', 'bar', {
+            labels: s.timeline.map(i => i.date),
+            datasets: [
+                { label: 'User Calls',        data: s.timeline.map(i => i.calls),
+                  backgroundColor: 'rgba(54,162,235,0.6)' },
+                { label: 'Compression Calls', data: s.timeline.map(i => (ctMap[i.date] || {}).compress_calls || 0),
+                  backgroundColor: 'rgba(255,159,64,0.6)' },
+            ]
+        }, { scales: { x: { stacked: true }, y: { stacked: true } } });
+
+        getOrCreate('chartCompressTokens', 'bar', {
+            labels: ct.map(i => i.date),
+            datasets: [
+                { label: 'Prompt Tokens (context sent)',    data: ct.map(i => i.tokens_prompt),
+                  backgroundColor: 'rgba(255,159,64,0.5)' },
+                { label: 'Completion Tokens (summary out)', data: ct.map(i => i.tokens_completion),
+                  backgroundColor: 'rgba(153,102,255,0.5)' },
+            ]
+        }, { scales: { x: { stacked: true }, y: { stacked: true } } });
+
+        const st = s.sessions_timeline || [];
+        getOrCreate('chartSessions', 'bar', {
+            labels: st.map(i => i.date),
+            datasets: [
+                { label: 'Active Sessions', data: st.map(i => i.session_count),
+                  backgroundColor: 'rgba(75,192,192,0.5)', yAxisID: 'y' },
+                { label: 'Avg Message Depth', data: st.map(i => i.avg_messages),
+                  type: 'line', borderColor: 'rgba(255,99,132,1)',
+                  fill: false, tension: 0.2, yAxisID: 'y1' },
+            ]
+        }, { scales: {
+            y:  { type: 'linear', position: 'left',  title: { display: true, text: 'Sessions' } },
+            y1: { type: 'linear', position: 'right', title: { display: true, text: 'Avg msgs' }, grid: { drawOnChartArea: false } },
+        }});
+        // --- Per-node performance charts ---
+        const np = s.node_perf;
+        if (np) {
+            getOrCreate('chartNodeThroughput', 'line', {
+                labels: np.throughput.labels,
+                datasets: nodeLineDatasets(np.throughput, '0.15'),
+            });
+
+            getOrCreate('chartNodeLatency', 'line', {
+                labels: np.latency.labels,
+                datasets: nodeLineDatasets(np.latency, '0.15'),
+            }, { scales: { y: { title: { display: true, text: 'ms' } } } });
+
+            getOrCreate('chartNodeSuccess', 'line', {
+                labels: np.success_rate.labels,
+                datasets: nodeLineDatasets(np.success_rate, '0.15'),
+            }, { scales: { y: { min: 0, max: 100, title: { display: true, text: '%' } } } });
+
+            getOrCreate('chartNodeDist', 'doughnut', {
+                labels: np.distribution.labels,
+                datasets: [{
+                    data: np.distribution.data,
+                    backgroundColor: np.distribution.labels.map((_, i) => nodeColor(i, '0.7')),
+                }]
+            }, { interaction: { mode: 'nearest', intersect: true } });
+        }
+    } catch (e) { console.error('fetchMetrics', e); }
+}
+
+// Resize charts when Stats tab becomes visible
+document.getElementById('tab-stats-btn').addEventListener('shown.bs.tab', () => {
+    Object.values(charts).forEach(c => c.resize());
+    if (!Object.keys(charts).length) fetchMetrics();
+});
+
+// ───────── Recent data ─────────
+function emptyRow(cols, msg = 'No data') {
+    return `<tr><td colspan="${cols}" class="text-center text-muted py-2">${msg}</td></tr>`;
+}
+
+async function fetchRecent() {
+    try {
+        const d = await fetch('/api/recent').then(r => r.json());
+
+        // inference_events
+        const ie = document.querySelector('#tbl-inference tbody');
+        ie.innerHTML = d.inference_events.length
+            ? d.inference_events.map(r => `<tr>
+                <td>${esc(r.id)}</td><td class="monospace">${esc(r.ts)}</td>
+                <td>${esc(r.user_id)}</td>
+                <td class="monospace text-muted">${esc(r.node_id)}</td>
+                <td>${esc(r.model)}</td>
+                <td><span class="badge ${r.status === 'success' ? 'bg-success' : 'bg-danger'}">${esc(r.status)}</span></td>
+                <td>${r.duration_ms ?? '—'}</td>
+                <td>${r.tokens_prompt ?? '—'}</td><td>${r.tokens_completion ?? '—'}</td>
+              </tr>`).join('')
+            : emptyRow(9);
+
+        // node_snapshots
+        const ns = document.querySelector('#tbl-snapshots tbody');
+        ns.innerHTML = d.node_snapshots.length
+            ? d.node_snapshots.map(r => `<tr>
+                <td>${esc(r.id)}</td><td class="monospace">${esc(r.ts)}</td>
+                <td>${esc(r.user_id)}</td><td>${esc(r.active_nodes)}</td>
+              </tr>`).join('')
+            : emptyRow(4);
+
+        // sessions
+        const ss = document.querySelector('#tbl-sessions tbody');
+        ss.innerHTML = d.sessions.length
+            ? d.sessions.map(r => `<tr>
+                <td class="monospace text-muted" title="${esc(r.session_id)}">${esc(String(r.session_id).substring(0,8))}…</td>
+                <td>${esc(r.owner_id)}</td><td>${esc(r.message_count)}</td>
+                <td class="monospace">${esc(r.created_at)}</td>
+                <td class="monospace">${esc(r.last_active)}</td>
+              </tr>`).join('')
+            : emptyRow(5);
+    } catch (e) { console.error('fetchRecent', e); }
+}
+
+// Load recent data when that tab is opened
+document.getElementById('tab-recent-btn').addEventListener('shown.bs.tab', fetchRecent);
+
+// ───────── Init ─────────
+setInterval(fetchNodes, 10000);
+setInterval(fetchMetrics, 300000);
+fetchNodes();
+fetchMetrics();
+</script>
+</body>
+</html>

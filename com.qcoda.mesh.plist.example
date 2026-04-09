@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LLMesh Node Agent — macOS Launch Agent (template)
+
+  Rename this file to `com.qcoda.mesh.plist` and replace every placeholder
+  below before installing. The real `com.qcoda.mesh.plist` is gitignored —
+  do not commit it. See decisions.md D016 for the full pattern.
+
+  Install:
+    cp com.qcoda.mesh.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.qcoda.mesh.plist
+    launchctl list | grep qcoda
+
+  See docs/macos_launchd.md for the full setup tutorial.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qcoda.mesh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/your/venv/bin/python</string>
+        <string>/path/to/llmesh-repo/lib/agent/client.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/llmesh-repo</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/com.qcoda.mesh.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.qcoda.mesh.err</string>
+</dict>
+</plist>

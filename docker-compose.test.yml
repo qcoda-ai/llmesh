@@ -1,0 +1,55 @@
+# Standalone compose stack for the Docker+Postgres test suite.
+# Identical to docker-compose.yml except:
+#   - Hub binds port 18766 only (avoids conflict with a running local hub on 8000)
+#   - server_config.json bind mount points at the committed test fixture
+#   - SESSION_MAX_TURNS=4 to exercise session turns in tests
+#   - SESSION_MEMORY_MODE=cutoff — no HF model download, instant startup
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d --build --wait
+#   docker compose -f docker-compose.test.yml down --volumes
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    # TEST-ONLY credentials. This stack is ephemeral (torn down with --volumes),
+    # binds only to localhost:18766, and is never meant to run in production.
+    # For production, use docker-compose.yml which requires POSTGRES_* from .env.
+    environment:
+      POSTGRES_DB: llmesh
+      POSTGRES_USER: llmesh
+      POSTGRES_PASSWORD: llmesh
+    volumes:
+      - llmesh_test_pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmesh -d llmesh"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hub:
+    build: .
+    ports:
+      - "18766:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./tests/fixtures/server_config.json:/app/server_config.json:ro
+      - llmesh_test_data:/data
+      - llmesh_test_hf_cache:/home/appuser/.cache/huggingface
+    environment:
+      SESSION_BACKEND: postgres
+      DATABASE_URL: postgresql://llmesh:llmesh@postgres:5432/llmesh
+      SESSION_MAX_TURNS: "4"
+      SESSION_MEMORY_MODE: cutoff
+      # Bypass the sample-key startup guard — the bind-mounted fixture above
+      # intentionally contains publicly known keys. TEST-ONLY. See D020.
+      LLMESH_ALLOW_SAMPLE_KEYS: "1"
+    restart: unless-stopped
+
+volumes:
+  llmesh_test_pg:
+  llmesh_test_data:
+  llmesh_test_hf_cache:

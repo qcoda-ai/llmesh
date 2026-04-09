@@ -1,0 +1,55 @@
+# LLMesh Node Agent — systemd unit (template)
+#
+# Rename this file to `nodeclient.service` and replace every placeholder
+# below before installing. The real `nodeclient.service` is gitignored —
+# do not commit it. See decisions.md D016 for the full pattern.
+#
+# Install:
+#   sudo cp nodeclient.service /etc/systemd/system/llmesh-node.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now llmesh-node
+#   journalctl -u llmesh-node -f
+
+[Unit]
+Description=LLMesh Node Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/llmesh
+Environment="PATH=/opt/llmesh/.venv/bin"
+
+# Force unbuffered Python stdio so `print()` diagnostics reach journalctl
+# immediately. The agent code also calls `sys.stdout.reconfigure(line_buffering=True)`
+# at startup (D017) — this env var is belt-and-braces in case that call ever
+# stops working. Do not remove.
+Environment="PYTHONUNBUFFERED=1"
+
+# Hub URL — replace with your LLMesh hub's public address
+Environment="HUB_URL=https://your-hub.example.com"
+
+# API key issued to this node by the hub operator. NEVER commit a real key.
+# The hub will refuse to start if this value is left as a placeholder
+# (see decisions.md D013, D016).
+Environment="LLMESH_API_KEY=change-me-key"
+
+# vLLM backend (optional — leave unset to disable vLLM detection on this node)
+Environment="VLLM_HOST=http://127.0.0.1:8000"
+# Optional explicit vLLM context window. Auto-detected from /v1/models if unset.
+# See decisions.md D015.
+Environment="VLLM_MAX_CONTEXT=32768"
+
+# Optional vLLM bearer token (for LiteLLM proxy or auth-protected vLLM).
+# See decisions.md D014 and docs/integrations/litellm.md.
+# Environment="VLLM_API_KEY=replace-me"
+# Environment="VLLM_HEALTH_PATH=/health/liveliness"
+
+ExecStart=/opt/llmesh/.venv/bin/python -m lib.agent.client
+ExecReload=/bin/kill -HUP ${MAINPID}
+RestartSec=30
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

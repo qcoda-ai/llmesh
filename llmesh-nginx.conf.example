@@ -1,0 +1,117 @@
+# LLMesh Hub — nginx reverse proxy config (template)
+#
+# Rename this file to `llmesh-nginx.conf` and replace `your-hub.example.com`
+# with your real hostname before installing. The real `llmesh-nginx.conf` is
+# gitignored — do not commit it. See decisions.md D016 for the full pattern.
+#
+# Install:
+#   sudo cp llmesh-nginx.conf /etc/nginx/sites-available/llmesh
+#   sudo ln -s /etc/nginx/sites-available/llmesh /etc/nginx/sites-enabled/llmesh
+#   sudo certbot --nginx -d your-hub.example.com
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Notes:
+# - The hub itself listens on 127.0.0.1:5109 (uvicorn) — change if your
+#   `llmesh.service` uses a different port.
+# - SSE / streaming endpoints below MUST have `proxy_buffering off` and a
+#   long `proxy_read_timeout`. See `.qcoda/deployment.md` for rationale.
+
+server {
+
+        root /home/www/your-hub.example.com/htdocs;
+        index index.html index.htm index.php;
+
+        server_name your-hub.example.com;
+
+        # re: 400 Bad Request - request header or cookie too large
+        # https://stackoverflow.com/questions/17524396/400-bad-request-request-header-or-cookie-too-large
+        large_client_header_buffers 4 32k;
+
+        # --- SSE / streaming endpoints (must not buffer) ---
+        # Ref: .qcoda/deployment.md — "proxy_buffering off required on /v1/chat/completions,
+        #   /v1/messages, and /tasks/.../stream — without this nginx buffers the full SSE
+        #   response, clients see nothing until inference completes."
+        # Ref: .qcoda/features/feature_streaming.md — Ollama SSE token streaming
+        # Ref: .qcoda/deployment.md — "proxy_read_timeout 620s — long-running inference
+        #   requests must not time out at the proxy"
+
+        # OpenAI + Anthropic inference endpoints (SSE when stream: true)
+        location ~ ^/v1/(chat/completions|messages) {
+                proxy_pass http://127.0.0.1:5109;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Scheme $scheme;
+
+                proxy_buffering off;            # flush each SSE chunk to client immediately
+                proxy_cache off;                # no caching of event streams
+                gzip off;                       # prevent buffering for compression
+                proxy_read_timeout 620s;        # long inference window (default 60s is too short)
+                proxy_http_version 1.1;         # required for chunked transfer encoding (SSE)
+                proxy_set_header Connection "keep-alive";
+        }
+
+        # Agent → Hub streaming chunk upload endpoint
+        # Ref: .qcoda/features/feature_streaming.md — "POST /tasks/{node}/{task}/stream"
+        location ~ ^/tasks/.*/stream {
+                proxy_pass http://127.0.0.1:5109;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Scheme $scheme;
+
+                proxy_buffering off;
+                proxy_request_buffering off;
+                proxy_cache off;
+                gzip off;
+                proxy_read_timeout 620s;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "keep-alive";
+        }
+
+        # Dashboard task status SSE — live token streaming to the browser
+        location ~ ^/dashboard/task/.*/sse/?$ {
+                proxy_pass http://127.0.0.1:5109;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Scheme $scheme;
+
+                proxy_buffering off;
+                proxy_cache off;
+                gzip off;
+                proxy_read_timeout 620s;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "keep-alive";
+        }
+
+        # --- Catch-all: all other endpoints ---
+        location / {
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Script-Name /;
+                proxy_set_header X-Scheme $scheme;
+                proxy_set_header Host $host;
+                proxy_pass http://127.0.0.1:5109/;
+                proxy_redirect      off;
+                proxy_read_timeout 620s;        # non-streaming inference also blocks for full generation
+                access_log /var/log/nginx/llmesh.access.log;
+                error_log  /var/log/nginx/llmesh.error.log;
+        }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/your-hub.example.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/your-hub.example.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}
+
+server {
+        server_name your-hub.example.com;
+        listen 80;
+}
+server {
+    if ($host = your-hub.example.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    listen 80;
+    return 404; # managed by Certbot
+}
