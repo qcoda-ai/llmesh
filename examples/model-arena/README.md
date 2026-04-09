@@ -2,6 +2,8 @@
 
 A/B test local LLMs across your network with LLMesh.
 
+![Model Arena demo](demo.gif)
+
 Send the same prompt to two different models through your LLMesh hub, see both responses stream side by side, and compare latency and token usage.
 
 ## Why

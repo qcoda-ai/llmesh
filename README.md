@@ -2,6 +2,8 @@
 
 LLMesh is a distributed workload orchestration system that routes AI inference tasks to a decentralized network of compute nodes based on hardware fitness and availability. This project establishes the foundation for managing robust, intelligent workloads across multiple environments.
 
+![LLMesh demo](demo.gif)
+
 ## Core Project Components
 
 Based on our recent implementation phases, the system is designed around two primary components:
