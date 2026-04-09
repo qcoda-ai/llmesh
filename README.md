@@ -131,7 +131,7 @@ LLMesh includes a cross-platform system tray application that runs the agent pur
 > | `VLLM_HOST` | _(disabled)_ | Base URL for an OpenAI-compatible vLLM server (or any compatible endpoint — host and port, optionally a path subroute, e.g. `http://gpu.internal:8001` or `https://proxy.example.com/litellm`). Set to enable the vLLM backend. |
 > | `VLLM_API_KEY` | _(none)_ | Optional bearer token attached to every request against `VLLM_HOST`. Plain local vLLM does not need this; set it for hardened reverse-proxied vLLM or LiteLLM Proxy. See [docs/integrations/litellm.md](docs/integrations/litellm.md). |
 > | `VLLM_HEALTH_PATH` | `/health` | Path the agent probes for vLLM liveness. LiteLLM users should set this to `/health/liveliness` because LiteLLM's `/health` runs a real upstream model probe and is too heavy for a 2-second liveness check. |
-> | `VLLM_MAX_CONTEXT` | _(auto-detect)_ | Optional explicit override for the vLLM context window the agent reports to the hub. By default the agent auto-detects this from `max_model_len` in vLLM's `/v1/models` response. Set this when running behind a proxy that strips the field, or to clamp the advertised window below the model's actual capability. See [decisions.md::D015](.qcoda/decisions.md). |
+> | `VLLM_MAX_CONTEXT` | _(auto-detect)_ | Optional explicit override for the vLLM context window the agent reports to the hub. By default the agent auto-detects this from `max_model_len` in vLLM's `/v1/models` response. Set this when running behind a proxy that strips the field, or to clamp the advertised window below the model's actual capability. |
 > | `MLX_HOST` | _(disabled)_ | Base URL for a local MLX server. Set to enable MLX backend. |
 > | `OLLAMA_PARALLEL_SLOTS` | _(auto)_ | Override auto-detected concurrent inference slot count |
 
@@ -148,7 +148,7 @@ python -m vllm.entrypoints.openai.api_server \
     --max-model-len 32768
 ```
 
-`--max-model-len` is the entire context window (prompt + completion) and is fixed for the lifetime of the vLLM process — it determines how much KV-cache memory vLLM allocates at startup. The agent auto-detects this value from the `max_model_len` field on each model card in vLLM's `/v1/models` response and reports it to the hub as the node's `context_size`, so the routing layer makes correct decisions for vLLM-backed nodes (see [decisions.md::D015](.qcoda/decisions.md)).
+`--max-model-len` is the entire context window (prompt + completion) and is fixed for the lifetime of the vLLM process — it determines how much KV-cache memory vLLM allocates at startup. The agent auto-detects this value from the `max_model_len` field on each model card in vLLM's `/v1/models` response and reports it to the hub as the node's `context_size`, so the routing layer makes correct decisions for vLLM-backed nodes .
 
 vLLM is only enabled when `VLLM_HOST` is set. The host can include a port and an optional path subroute:
 
@@ -161,8 +161,7 @@ VLLM_HOST=http://127.0.0.1:8001 LLMESH_API_KEY="..." python -m lib.agent.client
 2. `max_model_len` auto-detected from `/v1/models` — zero operator config, self-corrects when you restart vLLM with a different `--max-model-len`. The path to prefer for vanilla vLLM.
 3. `OLLAMA_NUM_CTX` — conservative legacy fallback. The agent prints a warning at registration if this fallback is used on a vLLM node.
 
-**Per-request `num_ctx` override is Ollama-only.** A client request asking the hub for a smaller window than vLLM is configured for is silently ignored on the vLLM path — the OpenAI Chat Completions API has no field for context-window override and vLLM's window is fixed at server startup. If you need a smaller window on vLLM, restart vLLM with a smaller `--max-model-len`. See [decisions.md::D010](.qcoda/decisions.md) for the cross-reference.
-
+**Per-request `num_ctx` override is Ollama-only.** A client request asking the hub for a smaller window than vLLM is configured for is silently ignored on the vLLM path — the OpenAI Chat Completions API has no field for context-window override and vLLM's window is fixed at server startup. If you need a smaller window on vLLM, restart vLLM with a smaller `--max-model-len`. 
 **Auth-protected vLLM (or LiteLLM Proxy):** set `VLLM_API_KEY` to attach a bearer token to every request the agent makes against `VLLM_HOST`, and (for LiteLLM specifically) set `VLLM_HEALTH_PATH=/health/liveliness`. Full integration guide in [docs/integrations/litellm.md](docs/integrations/litellm.md).
 
 **MLX (macOS Apple Silicon)**
