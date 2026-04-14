@@ -80,6 +80,35 @@ A template is provided at `com.qcoda.mesh.plist.example` in the repository root.
 
 ---
 
+## Required Environment Variables
+
+The agent needs two environment variables to connect to the hub:
+
+| Variable | Purpose |
+|---|---|
+| `HUB_URL` | The URL of your LLMesh hub (e.g. `http://localhost:4000`) |
+| `LLMESH_API_KEY` | API key used to authenticate with the hub |
+
+You can set these in one of two ways:
+
+1. **Project `.env` file** — add them to the `.env` file in your project directory. As long as `WorkingDirectory` in the plist points to your project root, the agent will pick them up automatically via `python-dotenv`.
+
+2. **Plist `EnvironmentVariables`** — define them directly in the plist by adding an `EnvironmentVariables` block inside the top-level `<dict>`:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+    <key>HUB_URL</key>
+    <string>http://localhost:4000</string>
+    <key>LLMESH_API_KEY</key>
+    <string>your-api-key-here</string>
+</dict>
+```
+
+If both are present, the plist environment variables take precedence over the `.env` file.
+
+---
+
 ## Step-by-Step Installation
 
 ### Step 1 — Create the Plist
