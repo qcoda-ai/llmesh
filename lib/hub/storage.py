@@ -27,6 +27,9 @@ def verify_node_token(node_id: str, token: str) -> bool:
     return secrets.compare_digest(node.node_token, token)
 
 def prune_inactive_nodes(max_age_sec: float = 90.0) -> list[str]:
+    """Remove nodes whose last_seen is older than max_age_sec. Caller is
+    expected to call tasks.drop_node_queue(node_id) for each returned id
+    AFTER recovering any pending/claimed tasks (see D035 + server.cleanup_loop)."""
     cutoff = time.time() - max_age_sec
     stale = [nid for nid, n in _nodes.items() if n.last_seen < cutoff]
     for nid in stale:

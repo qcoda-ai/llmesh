@@ -229,6 +229,13 @@ On first startup, the hub downloads a small GGUF model (~300 MB) from HuggingFac
 
 | `compress.model_repo` | `COMPRESS_MODEL_REPO` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | HuggingFace repo ID |
 | `stream.chunk_timeout` | `STREAM_CHUNK_TIMEOUT` | `120.0` | Max seconds between tokens before timeout |
+| — | `MODELS_CACHE_TTL` | `10.0` | Seconds to cache `GET /v1/models` per owner. `0` disables. See D027. |
+| — | `MAX_INPUT_BYTES` | `32768` | Max bytes per chat message content / per embedding input string. Overflow → 413. See D032. |
+| — | `MAX_MESSAGES` | `200` | Max messages per chat request. Overflow → 413. See D032. |
+| — | `MAX_BATCH_EMBEDDINGS` | `128` | Max input strings per `/v1/embeddings` request. Overflow → 413. See D032. |
+| — | `STREAM_QUEUE_MAX` | `256` | Bounded SSE chunk queue size (drop-oldest on overflow). See D033. |
+| — | `DEFAULT_EMBEDDING_MODEL` | `nomic-embed-text` | Model used when `/v1/embeddings` omits `model`. See D028. |
+| — | `LLMESH_CONFIG_PATH` | _(repo root `server_config.json`)_ | Override path to the hub config file (used by the test suite). |
 | `compress.model_file` | `COMPRESS_MODEL_FILE` | `qwen2.5-0.5b-instruct-q4_k_m.gguf` | GGUF filename within that repo |
 | `compress.context_size` | `COMPRESS_MODEL_CTX` | `4096` | Context window (tokens) |
 | `compress.n_threads` | `COMPRESS_N_THREADS` | _(CPU count)_ | CPU threads for inference |
@@ -306,7 +313,7 @@ Inference events and node snapshots accumulate indefinitely by default. Pruning 
 
 ## API Endpoints
 
-Once the Hub is running, it exposes two standard LLM API endpoints. Point any compatible SDK at `http://localhost:8000` using your API key from `server_config.json`.
+Once the Hub is running, it exposes three standard LLM API endpoints. Point any compatible SDK at `http://localhost:8000` using your API key from `server_config.json`.
 
 ### OpenAI-Compatible (`/v1/chat/completions`)
 
@@ -329,6 +336,30 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}]
 )
 ```
+
+### OpenAI-Compatible Embeddings (`/v1/embeddings`)
+
+Embeddings via Ollama. Default model `nomic-embed-text` — `ollama pull nomic-embed-text` on at least one agent node first.
+
+```bash
+curl -X POST http://localhost:8000/v1/embeddings \
+     -H "Authorization: Bearer my_secret_key_1" \
+     -H "Content-Type: application/json" \
+     -d '{"model": "nomic-embed-text", "input": "hello world"}'
+```
+
+`input` may be a single string or an array of strings (batch). Response follows the OpenAI shape — `data[i].embedding` is a list of floats.
+
+**Python (OpenAI SDK)**:
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="my_secret_key_1", base_url="http://localhost:8000/v1")
+resp = client.embeddings.create(model="nomic-embed-text", input=["alpha", "beta"])
+vectors = [d.embedding for d in resp.data]
+```
+
+Bounds (configurable via env): `MAX_INPUT_BYTES=32768`, `MAX_BATCH_EMBEDDINGS=128`. Overflow returns `413`. Empty input returns `400`. No node serving the requested embedding model returns `503` with a hint.
 
 ### Anthropic-Compatible (`/v1/messages`)
 

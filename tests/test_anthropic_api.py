@@ -41,11 +41,19 @@ _hub_proc: subprocess.Popen | None = None
 
 def start_hub():
     global _hub_proc
+    fixtures_cfg = os.path.join(
+        os.path.dirname(__file__), "fixtures", "server_config.json"
+    )
     env = os.environ.copy()
     env.update({
         "SESSION_MEMORY_MODE": "cutoff",   # no compression model needed
         "SESSION_DB": ":memory:",           # ephemeral
         "SESSION_MAX_TURNS": "4",
+        # Point the hub at the test fixtures config so my_secret_key_* are
+        # registered owner keys. The fixture intentionally uses publicly known
+        # placeholder keys, so the sample-key guard must be bypassed for tests.
+        "LLMESH_CONFIG_PATH": fixtures_cfg,
+        "LLMESH_ALLOW_SAMPLE_KEYS": "1",
     })
     _hub_proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "lib.hub.server:app", "--port", "18765", "--log-level", "warning"],
@@ -107,6 +115,8 @@ class FakeNode(threading.Thread):
                 "os_name": "Linux",
                 "ollama_available": True,
                 "ollama_models": [MODEL],
+                "embedding_models": ["nomic-embed-text"],
+                "model_context": {MODEL: 8192, "nomic-embed-text": 2048},
             }
         }, timeout=5)
         assert r.status_code == 200, f"Registration failed: {r.text}"
@@ -133,6 +143,25 @@ class FakeNode(threading.Thread):
                 r = httpx.get(f"{HUB_BASE}/tasks/{self.node_id}/pending", headers=auth, timeout=3)
                 if r.status_code == 200:
                     for task in r.json():
+                        if task.get("kind") == "embedding":
+                            inputs = (task.get("payload") or {}).get("input") or []
+                            # Synthetic 8-dim vectors derived from input length —
+                            # deterministic, easy to assert in tests.
+                            vectors = [
+                                [float((len(s) + i + j) % 7) for j in range(8)]
+                                for i, s in enumerate(inputs)
+                            ]
+                            httpx.post(
+                                f"{HUB_BASE}/tasks/{self.node_id}/complete/{task['task_id']}",
+                                json={
+                                    "embeddings": vectors,
+                                    "prompt_tokens": sum(len(s.split()) for s in inputs),
+                                    "completion_tokens": 0,
+                                },
+                                headers=auth,
+                                timeout=5,
+                            )
+                            continue
                         # Build a reply that echoes back the last user message
                         msgs = task.get("messages") or []
                         last_user = next(
@@ -252,10 +281,13 @@ def test_error_output_triggers_fail():
                 pending = httpx.get(f"{HUB_BASE}/tasks/{bad_node_id}/pending", headers=auth, timeout=3)
                 if pending.status_code == 200:
                     for t in pending.json():
+                        # D034: agents must set the structured `error` flag —
+                        # substring matching is no longer a fallback.
                         httpx.post(
                             f"{HUB_BASE}/tasks/{bad_node_id}/complete/{t['task_id']}",
                             json={"output": "Error from Ollama Generate: 500 - model not found",
-                                  "prompt_tokens": 0, "completion_tokens": 0},
+                                  "prompt_tokens": 0, "completion_tokens": 0,
+                                  "error": True},
                             headers=auth,
                             timeout=3,
                         )
@@ -282,6 +314,8 @@ def test_error_output_triggers_fail():
             "resources": {
                 "cpu_cores": 4, "ram_gb": 16, "os_name": "Linux",
                 "ollama_available": True, "ollama_models": [MODEL],
+                "embedding_models": ["nomic-embed-text"],
+                "model_context": {MODEL: 8192, "nomic-embed-text": 2048},
             }
         }, timeout=5)
 

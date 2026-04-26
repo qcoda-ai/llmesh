@@ -12,7 +12,10 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.templating import Jinja2Templates
 from . import config as _config  # noqa: F401 — must import first to populate env vars before sessions/metrics read them
-from .models import RegistrationRequest, Node, HeartbeatRequest, RegistrationResponse
+from .models import (
+    RegistrationRequest, Node, HeartbeatRequest, RegistrationResponse,
+    EmbeddingsRequest, TaskKind,
+)
 import asyncio
 import json
 from . import storage
@@ -52,6 +55,24 @@ RATE_LIMIT_LIST      = os.getenv("RATE_LIMIT_LIST",      "120/minute")
 RATE_LIMIT_REGISTER  = os.getenv("RATE_LIMIT_REGISTER",  "20/minute")
 RATE_LIMIT_LOGIN     = os.getenv("RATE_LIMIT_LOGIN",     "10/minute")
 RATE_LIMIT_HEARTBEAT = os.getenv("RATE_LIMIT_HEARTBEAT", "30/minute")
+
+# Per-owner TTL cache for GET /v1/models. The endpoint scans the node registry
+# on every call; under rapid back-to-back client traffic (e.g. qc_eval harness)
+# this keeps it off the hot path. Set MODELS_CACHE_TTL=0 to disable. See D027.
+MODELS_CACHE_TTL = float(os.getenv("MODELS_CACHE_TTL", "10.0"))
+_models_cache: dict[str, tuple[float, dict]] = {}
+
+# Payload bounds (D032). Reject oversize requests at the hub edge so a single
+# pathological client cannot exhaust the event loop's memory budget.
+MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_BYTES", "32768"))
+MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "200"))
+MAX_BATCH_EMBEDDINGS = int(os.getenv("MAX_BATCH_EMBEDDINGS", "128"))
+
+# Bounded stream queue (D033). Drop-oldest on overflow.
+STREAM_QUEUE_MAX = int(os.getenv("STREAM_QUEUE_MAX", "256"))
+
+# Default embedding model used when /v1/embeddings is called without one.
+DEFAULT_EMBEDDING_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "nomic-embed-text")
 
 
 def _rate_key(request: Request) -> str:
@@ -148,18 +169,26 @@ class StreamChunk(BaseModel):
 
 
 def _is_error_result(result: dict) -> bool:
-    if result.get("error"):
-        return True
-    output = result.get("output", "")
-    return output.startswith("Failed") or output.startswith("Error from")
+    """D034: structured error flag is the only signal. Substring fallback
+    against `output` was removed — it coupled retry logic to specific English
+    error strings."""
+    return bool(result.get("error"))
 
 
 def _node_has_model(n, model: str) -> bool:
     return (
         model in getattr(n.resources, "ollama_models", []) or
+        model in getattr(n.resources, "embedding_models", []) or
         model in getattr(n.resources, "vllm_models", []) or
         model in getattr(n.resources, "mlx_models", [])
     )
+
+
+def _node_has_embedding_model(n, model: str) -> bool:
+    """D028: embedding routing is gated on `embedding_models` only. A chat-only
+    model in `ollama_models` does not qualify, even if Ollama would accept the
+    request shape — the response would be useless."""
+    return model in getattr(n.resources, "embedding_models", [])
 
 
 def _node_is_capable(n) -> bool:
@@ -170,17 +199,64 @@ def _node_is_capable(n) -> bool:
     )
 
 
+def _node_model_context(n, model: str) -> int:
+    """D030: per-model context lookup with fallback to the legacy node-level
+    scalar `context_size`."""
+    model_ctx = getattr(n.resources, "model_context", {}) or {}
+    if model in model_ctx and isinstance(model_ctx[model], int) and model_ctx[model] > 0:
+        return model_ctx[model]
+    return getattr(n.resources, "context_size", 8192)
+
+
+def _validate_chat_payload(messages: list[dict]) -> None:
+    """D032: reject oversize chat payloads before they hit the routing pipeline."""
+    if len(messages) > MAX_MESSAGES:
+        raise HTTPException(status_code=413, detail=f"messages exceeds MAX_MESSAGES={MAX_MESSAGES}")
+    for m in messages:
+        content = m.get("content", "") if isinstance(m, dict) else ""
+        if isinstance(content, list):
+            # Flattened later; size-bound the assembled text.
+            content = "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if isinstance(content, str) and len(content.encode("utf-8")) > MAX_INPUT_BYTES:
+            raise HTTPException(status_code=413, detail=f"message content exceeds MAX_INPUT_BYTES={MAX_INPUT_BYTES}")
+
+
+def _validate_embeddings_payload(inputs: list[str]) -> None:
+    """D032: reject oversize embedding batches and per-input strings."""
+    if not inputs:
+        raise HTTPException(status_code=400, detail="`input` must be a non-empty string or non-empty list of strings")
+    if len(inputs) > MAX_BATCH_EMBEDDINGS:
+        raise HTTPException(status_code=413, detail=f"batch exceeds MAX_BATCH_EMBEDDINGS={MAX_BATCH_EMBEDDINGS}")
+    for s in inputs:
+        if not isinstance(s, str):
+            raise HTTPException(status_code=400, detail="every `input` element must be a string")
+        if not s:
+            raise HTTPException(status_code=400, detail="`input` strings must be non-empty")
+        if len(s.encode("utf-8")) > MAX_INPUT_BYTES:
+            raise HTTPException(status_code=413, detail=f"input element exceeds MAX_INPUT_BYTES={MAX_INPUT_BYTES}")
+
+
+def _capability_predicate_for_kind(kind: tasks.TaskKind):
+    """Pick the model-membership predicate for a task kind. Embedding tasks
+    must land on a node that explicitly classifies the model as embedding-
+    capable; chat tasks accept any backend that knows the model id."""
+    if kind is tasks.TaskKind.EMBEDDING:
+        return _node_has_embedding_model
+    return _node_has_model
+
+
 def _try_requeue(task: tasks.Task) -> bool:
     """Find a capable node not yet attempted and requeue the task. Returns True on success."""
     all_nodes = storage.get_all_nodes()
     current_time = time.time()
+    has_model = _capability_predicate_for_kind(task.kind)
     candidates = [
         n for n in all_nodes
         if n.owner_id == task.owner_id
         and n.node_id not in task.attempted_nodes
         and _node_is_capable(n)
         and (current_time - n.last_seen < 30)
-        and _node_has_model(n, task.model)
+        and has_model(n, task.model)
     ]
     if not candidates:
         return False
@@ -224,6 +300,9 @@ async def startup():
                 logger.info("Pruned %d inactive node(s): %s", len(pruned), pruned)
                 for dead_node_id in pruned:
                     _recover_tasks_from_dead_node(dead_node_id)
+                    # D035: drop the per-node queue residue AFTER recovery so
+                    # any pending/claimed tasks were given a chance to migrate.
+                    tasks.drop_node_queue(dead_node_id)
 
             evicted = await get_session_store().evict_expired()
             if evicted:
@@ -450,41 +529,88 @@ async def list_nodes(request: Request, authorization: str | None = Header(None))
         raise HTTPException(status_code=403, detail="Invalid API key")
     return [n for n in storage.get_all_nodes() if n.owner_id == owner_id]
 
-def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskResponse:
-    """Internal routing — owner_id must already be validated before calling."""
+def _select_node(owner_id: str, model: str, has_model_predicate) -> "Node | None":
+    """Find the best currently-online node for an owner+model pair, using the
+    given capability predicate. Sorted by RAM desc — D036 spec covers a
+    weighted score replacement that is intentionally deferred from this PR."""
     all_nodes = storage.get_all_nodes()
     current_time = time.time()
-
-    capable_nodes = [
+    capable = [
         n for n in all_nodes
-        if n.owner_id == req.owner_id
+        if n.owner_id == owner_id
         and _node_is_capable(n)
         and (current_time - n.last_seen < 30)
-        and _node_has_model(n, req.model)
+        and has_model_predicate(n, model)
     ]
+    if not capable:
+        return None
+    capable.sort(key=lambda n: n.resources.ram_gb, reverse=True)
+    return capable[0]
 
-    if not capable_nodes:
+
+def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskResponse:
+    """Internal routing — owner_id must already be validated before calling."""
+    selected_node = _select_node(req.owner_id, req.model, _node_has_model)
+    if selected_node is None:
         raise HTTPException(status_code=503, detail=f"No capable nodes currently online with model {req.model}")
 
-    capable_nodes.sort(key=lambda n: n.resources.ram_gb, reverse=True)
-    selected_node = capable_nodes[0]
-
     task_id = str(uuid.uuid4())
-    # Choose final num_ctx: request-specific > hub default
-    num_ctx = req.num_ctx if req.num_ctx is not None else DEFAULT_CONTEXT_WINDOW
 
-    task = tasks.Task(task_id=task_id, prompt=req.prompt, messages=req.messages,
-                      model=req.model, owner_id=req.owner_id, num_ctx=num_ctx)
+    # Per-model context window (D030): clamp request num_ctx so a client cannot
+    # ask for more than the model can serve. Falls back to node scalar.
+    model_ctx_cap = _node_model_context(selected_node, req.model)
+    requested = req.num_ctx if req.num_ctx is not None else DEFAULT_CONTEXT_WINDOW
+    if requested is None:
+        num_ctx = None
+    else:
+        num_ctx = min(int(requested), int(model_ctx_cap))
+
+    task = tasks.Task(
+        task_id=task_id,
+        kind=tasks.TaskKind.CHAT,
+        payload={"messages": req.messages, "prompt": req.prompt, "num_ctx": num_ctx},
+        model=req.model,
+        owner_id=req.owner_id,
+    )
     task.attempted_nodes.add(selected_node.node_id)
 
     if stream and getattr(selected_node.resources, "streaming_capable", False):
         task.stream = True
-        task.stream_queue = asyncio.Queue()
+        task.stream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
 
     tasks.queue_task_for_node(selected_node.node_id, task)
 
     logger.info("Routed task %s to node %s using model %s stream=%s", task_id, selected_node.node_id, req.model, task.stream)
 
+    return TaskResponse(task_id=task_id, node_assigned=selected_node.node_id)
+
+
+def _route_embedding(req: EmbeddingsRequest, owner_id: str, inputs: list[str]) -> TaskResponse:
+    """D028 routing: select an embedding-capable node and queue an embedding
+    task. Inputs must already be normalized (str → [str]) and bounds-checked."""
+    selected_node = _select_node(owner_id, req.model, _node_has_embedding_model)
+    if selected_node is None:
+        hint = ""
+        if req.model == DEFAULT_EMBEDDING_MODEL:
+            hint = f" — pull it on a node: `ollama pull {req.model}`"
+        raise HTTPException(
+            status_code=503,
+            detail=f"No nodes online with embedding model {req.model}{hint}",
+        )
+
+    task_id = str(uuid.uuid4())
+    task = tasks.Task(
+        task_id=task_id,
+        kind=tasks.TaskKind.EMBEDDING,
+        payload={"input": inputs},
+        model=req.model,
+        owner_id=owner_id,
+    )
+    task.attempted_nodes.add(selected_node.node_id)
+    tasks.queue_task_for_node(selected_node.node_id, task)
+
+    logger.info("Routed embedding task %s to node %s using model %s batch=%d",
+                task_id, selected_node.node_id, req.model, len(inputs))
     return TaskResponse(task_id=task_id, node_assigned=selected_node.node_id)
 
 
@@ -505,8 +631,24 @@ async def request_inference(request: Request, req: InferenceRequest, authorizati
 @limiter.limit(RATE_LIMIT_HEARTBEAT)
 async def get_pending_tasks_for_node(request: Request, node_id: str, _: None = Depends(_require_node_token)):
     pending = tasks.get_pending_tasks(node_id)
-    return [{"task_id": t.task_id, "prompt": t.prompt, "messages": t.messages,
-             "model": t.model, "stream": t.stream, "num_ctx": t.num_ctx} for t in pending]
+    out = []
+    for t in pending:
+        # Legacy fields (prompt/messages/num_ctx) are kept for chat tasks so
+        # older agents that only know the chat shape keep working. New `kind`
+        # and `payload` fields drive embedding dispatch (D028).
+        entry = {
+            "task_id": t.task_id,
+            "kind": t.kind.value,
+            "payload": t.payload,
+            "model": t.model,
+            "stream": t.stream,
+        }
+        if t.kind is tasks.TaskKind.CHAT:
+            entry["prompt"] = t.prompt
+            entry["messages"] = t.messages
+            entry["num_ctx"] = t.num_ctx
+        out.append(entry)
+    return out
 
 
 @app.post("/tasks/{node_id}/{task_id}/stream")
@@ -525,14 +667,30 @@ async def stream_task_chunk(
     if task.stream_cancelled:
         raise HTTPException(status_code=410, detail="Stream cancelled by client")
 
+    def _put_or_drop_oldest(item):
+        # D033: bounded queue with drop-oldest. A slow SSE consumer must not
+        # block the producing node — and the node should not OOM the hub.
+        try:
+            task.stream_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                _ = task.stream_queue.get_nowait()
+                logger.warning(
+                    "[stream] task=%s queue full (max=%d), dropped oldest chunk",
+                    task.task_id, STREAM_QUEUE_MAX,
+                )
+            except asyncio.QueueEmpty:
+                pass
+            task.stream_queue.put_nowait(item)
+
     if body.done:
         task.prompt_tokens = body.prompt_tokens
         task.completion_tokens = body.completion_tokens
         task.status = "completed"
-        task.stream_queue.put_nowait(None)  # sentinel — SSE generator closes on None
+        _put_or_drop_oldest(None)  # sentinel — SSE generator closes on None
         task.done_event.set()
     else:
-        task.stream_queue.put_nowait(body.chunk)
+        _put_or_drop_oldest(body.chunk)
 
     return JSONResponse(
         content={"status": "ok"},
@@ -554,9 +712,17 @@ async def submit_task_result(request: Request, node_id: str, task_id: str, resul
     if task.status in ("completed", "failed"):
         return {"status": "already_resolved"}
 
+    # Embedding result lives in `embeddings` (list[list[float]]) — chat result
+    # in `output` (str). Pick the right field per task kind so the stored
+    # `task.result` keeps its native type (D029).
+    if task.kind is tasks.TaskKind.EMBEDDING:
+        result_value: Any = result.get("embeddings")
+    else:
+        result_value = result.get("output", "")
+
     task = tasks.record_task_result(
         task_id,
-        result.get("output", ""),
+        result_value,
         prompt_tokens=result.get("prompt_tokens", 0),
         completion_tokens=result.get("completion_tokens", 0),
     )
@@ -575,7 +741,9 @@ async def submit_task_result(request: Request, node_id: str, task_id: str, resul
         # No alternate node — fall through to terminal failure
 
     if is_error:
-        tasks.fail_task(task.task_id, task.result)
+        # On error the agent reports a string under `output`; keep that for the
+        # human-readable failure message regardless of kind.
+        tasks.fail_task(task.task_id, result.get("output") or "task failed")
         _emit_inference_event(task, node_id, duration_ms, result, status="fail")
         _bridge_blocking_completion_to_stream_consumer(task, error=True)
     else:
@@ -625,6 +793,7 @@ def _emit_inference_event(task: tasks.Task, node_id: str, duration_ms: float,
         duration_ms=duration_ms,
         tokens_prompt=result.get("prompt_tokens", 0),
         tokens_completion=result.get("completion_tokens", 0),
+        kind=task.kind.value,
     )
 
 
@@ -688,10 +857,12 @@ async def get_nodes_for_owner(
             "context_size": getattr(n.resources, "context_size", 8192),
             "ollama_available": n.resources.ollama_available,
             "ollama_models": getattr(n.resources, "ollama_models", []),
+            "embedding_models": getattr(n.resources, "embedding_models", []),
             "vllm_available": getattr(n.resources, "vllm_available", False),
             "vllm_models": getattr(n.resources, "vllm_models", []),
             "mlx_available": getattr(n.resources, "mlx_available", False),
             "mlx_models": getattr(n.resources, "mlx_models", []),
+            "model_context": getattr(n.resources, "model_context", {}),
             "parallel_slots": getattr(n.resources, "parallel_slots", 1),
             "last_seen_sec": round(current_time - n.last_seen, 1)
         })
@@ -774,24 +945,44 @@ async def list_models(request: Request, authorization: str | None = Header(None)
     if not owner_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
 
+    now_mono = time.monotonic()
+    if MODELS_CACHE_TTL > 0:
+        cached = _models_cache.get(owner_id)
+        if cached and cached[0] > now_mono:
+            return cached[1]
+
     all_nodes = storage.get_all_nodes()
-    
-    # Aggregate models and their maximum context capacity across all nodes
-    model_info = {} # model_id -> max_ctx
+
+    # Aggregate per model:
+    #   max ctx (D031 dedup-by-id, max wins)
+    #   capability set ("chat" | "embed") drawn from which list it came from
+    # Capabilities are additive — a model registered as both ollama_models and
+    # embedding_models on different nodes ends up as ["chat","embed"].
+    model_ctx: dict[str, int] = {}
+    model_caps: dict[str, set[str]] = {}
     now = int(time.time())
-    
+
+    def _record(model_id: str, capability: str, ctx: int):
+        if ctx and ctx > 0:
+            model_ctx[model_id] = max(model_ctx.get(model_id, 0), ctx)
+        else:
+            model_ctx.setdefault(model_id, 0)
+        model_caps.setdefault(model_id, set()).add(capability)
+
     for n in all_nodes:
         if n.owner_id != owner_id:
             continue
-            
-        ctx = getattr(n.resources, "context_size", 8192)
-        node_models = (
-            getattr(n.resources, "ollama_models", []) +
-            getattr(n.resources, "vllm_models", []) +
-            getattr(n.resources, "mlx_models", [])
-        )
-        for m in node_models:
-            model_info[m] = max(model_info.get(m, 0), ctx)
+        node_default_ctx = getattr(n.resources, "context_size", 8192)
+        per_model = getattr(n.resources, "model_context", {}) or {}
+
+        for m in getattr(n.resources, "ollama_models", []):
+            _record(m, "chat", per_model.get(m, node_default_ctx))
+        for m in getattr(n.resources, "vllm_models", []):
+            _record(m, "chat", per_model.get(m, node_default_ctx))
+        for m in getattr(n.resources, "mlx_models", []):
+            _record(m, "chat", per_model.get(m, node_default_ctx))
+        for m in getattr(n.resources, "embedding_models", []):
+            _record(m, "embed", per_model.get(m, node_default_ctx))
 
     model_list = [
         {
@@ -799,12 +990,16 @@ async def list_models(request: Request, authorization: str | None = Header(None)
             "object": "model",
             "created": now,
             "owned_by": "llmesh-node",
-            "context_length": ctx_len
+            "context_length": model_ctx.get(m, 0) or 8192,
+            "capabilities": sorted(model_caps[m]),
         }
-        for m, ctx_len in model_info.items()
+        for m in sorted(model_caps.keys())
     ]
 
-    return {"object": "list", "data": model_list}
+    response = {"object": "list", "data": model_list}
+    if MODELS_CACHE_TTL > 0:
+        _models_cache[owner_id] = (now_mono + MODELS_CACHE_TTL, response)
+    return response
 
 async def _process_chat_completion(
     req_model: str,
@@ -817,6 +1012,8 @@ async def _process_chat_completion(
     owner_id = storage.authenticate_owner(api_key)
     if not owner_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+
+    _validate_chat_payload(messages)
 
     store = get_session_store()
 
@@ -1004,6 +1201,67 @@ async def anthropic_messages(
         }
     }
 
+@app.post("/v1/embeddings")
+@limiter.limit(RATE_LIMIT_INFERENCE)
+async def embeddings(
+    request: Request,
+    req: EmbeddingsRequest,
+    response: Response,
+    authorization: str | None = Header(None),
+):
+    """OpenAI-compatible embeddings endpoint (D028).
+
+    Routes to an embedding-capable Ollama node selected via the same node
+    pool as chat. Stateless — no session storage. Returns a fully assembled
+    OpenAI shape (object/data/model/usage)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Authorization header")
+    api_key = authorization.replace("Bearer ", "")
+    owner_id = storage.authenticate_owner(api_key)
+    if not owner_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+
+    # Normalize input → list[str] regardless of whether the client sent a
+    # single string or an array. Validate bounds before routing so we reject
+    # oversize requests without consuming a node slot (D032).
+    inputs = [req.input] if isinstance(req.input, str) else list(req.input)
+    _validate_embeddings_payload(inputs)
+
+    task_response = _route_embedding(req, owner_id, inputs)
+    queued_task = tasks.get_task_status(task_response.node_assigned, task_response.task_id)
+    if queued_task is None:
+        raise HTTPException(status_code=500, detail="Task not found after queuing")
+
+    try:
+        await asyncio.wait_for(queued_task.done_event.wait(), timeout=600.0)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"error": {"message": "LLMesh embedding task timed out", "type": "timeout"}})
+
+    if queued_task.status != "completed":
+        return JSONResponse(status_code=500, content={"error": {"message": queued_task.result or "embedding task failed", "type": "server_error"}})
+
+    vectors = queued_task.result or []
+    if not isinstance(vectors, list) or len(vectors) != len(inputs):
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": f"node returned {len(vectors) if isinstance(vectors, list) else 'invalid'} vectors for {len(inputs)} inputs", "type": "server_error"}},
+        )
+
+    data = [
+        {"object": "embedding", "index": i, "embedding": vec}
+        for i, vec in enumerate(vectors)
+    ]
+    return {
+        "object": "list",
+        "data": data,
+        "model": req.model,
+        "usage": {
+            "prompt_tokens": queued_task.prompt_tokens,
+            "total_tokens": queued_task.prompt_tokens,
+        },
+    }
+
+
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str, authorization: str | None = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -1072,6 +1330,7 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
         if _node_is_capable(n) and (current_time - n.last_seen < 30):
             all_node_models = (
                 getattr(n.resources, "ollama_models", []) +
+                getattr(n.resources, "embedding_models", []) +
                 getattr(n.resources, "vllm_models", []) +
                 getattr(n.resources, "mlx_models", [])
             )

@@ -23,7 +23,8 @@ _DDL = [
         duration_ms       REAL,
         tokens_prompt     INTEGER,
         tokens_completion INTEGER,
-        is_compression    INTEGER DEFAULT 0
+        is_compression    INTEGER DEFAULT 0,
+        kind              TEXT DEFAULT 'chat'
     )""",
     "CREATE INDEX IF NOT EXISTS idx_inf_user_ts ON inference_events(user_id, timestamp)",
     """CREATE TABLE IF NOT EXISTS node_snapshots (
@@ -50,6 +51,7 @@ _DDL = [
 _MIGRATIONS = [
     "ALTER TABLE inference_events ADD COLUMN is_compression INTEGER DEFAULT 0",
     "ALTER TABLE node_registry ADD COLUMN context_size INTEGER",
+    "ALTER TABLE inference_events ADD COLUMN kind TEXT DEFAULT 'chat'",
 ]
 
 
@@ -225,7 +227,8 @@ async def _flush_buffer() -> None:
     inf_rows = [
         (e["timestamp"], e["user_id"], e["node_id"], e["model"], e["status"],
          e.get("duration_ms"), e.get("tokens_prompt", 0), e.get("tokens_completion", 0),
-         1 if e.get("is_compression") else 0)
+         1 if e.get("is_compression") else 0,
+         e.get("kind", "chat"))
         for e in events if e.get("event") == "inference"
     ]
     snap_rows = [
@@ -238,8 +241,8 @@ async def _flush_buffer() -> None:
             await db.executemany(
                 "INSERT INTO inference_events "
                 "(timestamp, user_id, node_id, model, status, duration_ms, "
-                " tokens_prompt, tokens_completion, is_compression) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                " tokens_prompt, tokens_completion, is_compression, kind) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 inf_rows
             )
         if snap_rows:
@@ -255,10 +258,14 @@ async def _flush_buffer() -> None:
 
 def log_inference_event(user_id: str, node_id: str, model: str, status: str,
                         duration_ms: float, tokens_prompt: int, tokens_completion: int,
-                        is_compression: bool = False) -> None:
+                        is_compression: bool = False, kind: str = "chat") -> None:
     """Queue an inference event for the next batch flush. Sync-by-design:
     one list.append, no await, no coroutine spawning. Safe to call from any
-    context; the flush task picks it up on the next tick."""
+    context; the flush task picks it up on the next tick.
+
+    `kind` distinguishes chat vs embedding traffic for analytics. Stored in
+    the buffer as a tag — the underlying schema is unchanged for now (D028
+    follow-up may add a column once we have a migration cadence)."""
     _event_buffer.append({
         "event": "inference",
         "timestamp": time.time(),
@@ -270,6 +277,7 @@ def log_inference_event(user_id: str, node_id: str, model: str, status: str,
         "tokens_prompt": tokens_prompt,
         "tokens_completion": tokens_completion,
         "is_compression": is_compression,
+        "kind": kind,
     })
 
 

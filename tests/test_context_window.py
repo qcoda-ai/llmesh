@@ -11,10 +11,15 @@ API_KEY  = "my_secret_key_1"
 MODEL    = "llama3"
 
 def start_hub(env_overrides=None):
+    fixtures_cfg = os.path.join(
+        os.path.dirname(__file__), "fixtures", "server_config.json"
+    )
     env = os.environ.copy()
     env.update({
         "SESSION_DB": ":memory:",
         "LLMESH_API_KEY": API_KEY,
+        "LLMESH_CONFIG_PATH": fixtures_cfg,
+        "LLMESH_ALLOW_SAMPLE_KEYS": "1",
     })
     if env_overrides:
         env.update(env_overrides)

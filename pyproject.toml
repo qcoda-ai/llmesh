@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmesh"
-version = "0.1.0"
+version = "0.11.0"
 description = "Distributed workload orchestration for AI inference across decentralized compute nodes."
 readme = "README.md"
 license = { file = "LICENSE" }

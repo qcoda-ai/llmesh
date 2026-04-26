@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import random
+import re
 import secrets
 import sys
 import psutil
@@ -125,6 +127,64 @@ def get_ollama_models() -> list[str]:
     except Exception:
         pass
     return []
+
+
+# Embedding model detection (D028).
+# Allowlist of known-embedding model id prefixes — name-based heuristic plus
+# an explicit set so commonly-used models classify even when their name does
+# not contain "embed". Strip trailing tag (e.g. ":latest", ":v1.5") before
+# comparing to the allowlist.
+_EMBED_NAME_RE = re.compile(r"(embed|bge-|e5-|gte-)", re.IGNORECASE)
+_EMBED_ALLOWLIST = {
+    "nomic-embed-text",
+    "mxbai-embed-large",
+    "all-minilm",
+    "snowflake-arctic-embed",
+    "snowflake-arctic-embed2",
+    "paraphrase-multilingual",
+}
+
+
+def _is_embedding_model(name: str) -> bool:
+    base = name.split(":", 1)[0]
+    if base in _EMBED_ALLOWLIST:
+        return True
+    return bool(_EMBED_NAME_RE.search(name))
+
+
+def _ollama_model_context(model: str) -> int | None:
+    """Hit Ollama /api/show for one model and return its context length.
+
+    Ollama exposes context window under different keys depending on version
+    and model family (`model_info.<arch>.context_length`, `parameters`,
+    etc.). Best-effort lookup — returns None when nothing parseable is found,
+    in which case the caller falls back to the node-level scalar."""
+    try:
+        resp = httpx.post(
+            "http://localhost:11434/api/show",
+            json={"name": model},
+            timeout=3.0,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        # Newer Ollama returns model_info with arch-prefixed keys.
+        info = data.get("model_info", {})
+        for k, v in info.items():
+            if k.endswith(".context_length") and isinstance(v, int) and v > 0:
+                return v
+        # Older responses include a `parameters` text blob — best effort.
+        params = data.get("parameters", "")
+        if isinstance(params, str):
+            for line in params.splitlines():
+                if line.strip().startswith("num_ctx"):
+                    try:
+                        return int(line.strip().split()[-1])
+                    except ValueError:
+                        pass
+    except Exception:
+        return None
+    return None
 
 def check_vllm_available() -> bool:
     if not VLLM_HOST:
@@ -292,7 +352,13 @@ def _resolve_node_context_size(
 
 
 def gather_resources() -> dict:
-    ollama_models = get_ollama_models()
+    raw_ollama = get_ollama_models()
+    # Split Ollama tags into chat vs embedding (D028). Embedding-only models
+    # do not pollute the chat model list — `/v1/embeddings` filters on
+    # `embedding_models` and `/v1/chat/completions` on the chat lists.
+    ollama_chat = [m for m in raw_ollama if not _is_embedding_model(m)]
+    ollama_embed = [m for m in raw_ollama if _is_embedding_model(m)]
+
     vllm_up = check_vllm_available()
     vllm_models, vllm_detected_ctx = _query_vllm_models() if vllm_up else ([], None)
     vllm_max_context = VLLM_MAX_CONTEXT or vllm_detected_ctx
@@ -300,10 +366,24 @@ def gather_resources() -> dict:
     mlx_models = get_mlx_models() if mlx_up else []
     slots = compute_safe_parallel_slots()
     context_size = _resolve_node_context_size(
-        ollama_active=len(ollama_models) > 0,
+        ollama_active=len(raw_ollama) > 0,
         vllm_active=vllm_up,
         vllm_max_context=vllm_max_context,
     )
+
+    # Per-model context map (D030). Best-effort: only populates entries we
+    # can confidently determine. Hub falls back to `context_size` for any
+    # missing model.
+    model_context: dict[str, int] = {}
+    for m in raw_ollama:
+        ctx = _ollama_model_context(m)
+        if ctx:
+            model_context[m] = ctx
+    if vllm_max_context:
+        for m in vllm_models:
+            model_context[m] = vllm_max_context
+    # MLX does not expose per-model context; leave to fallback.
+
     if vllm_up:
         if vllm_max_context:
             src = "VLLM_MAX_CONTEXT" if VLLM_MAX_CONTEXT else "/v1/models max_model_len"
@@ -315,12 +395,15 @@ def gather_resources() -> dict:
                 f"see this node as a {OLLAMA_NUM_CTX}-token node. Set "
                 "`VLLM_MAX_CONTEXT` to fix routing decisions."
             )
+    if ollama_embed:
+        print(f"Embedding models detected: {ollama_embed}")
     return {
         "cpu_cores": psutil.cpu_count(logical=True),
         "ram_gb": round(psutil.virtual_memory().total / (1024.**3), 2),
         "os_name": platform.system(),
-        "ollama_available": len(ollama_models) > 0,
-        "ollama_models": ollama_models,
+        "ollama_available": len(raw_ollama) > 0,
+        "ollama_models": ollama_chat,
+        "embedding_models": ollama_embed,
         "vllm_available": vllm_up,
         "vllm_models": vllm_models,
         "mlx_available": mlx_up,
@@ -328,6 +411,7 @@ def gather_resources() -> dict:
         "parallel_slots": slots,
         "streaming_capable": True,
         "context_size": context_size,
+        "model_context": model_context,
     }
 
 class AppState:
@@ -339,12 +423,16 @@ class AppState:
         self.parallel_slots = 1  # updated after registration with the detected value
         self.vllm_models: list = []
         self.mlx_models: list = []
+        self.embedding_models: list = []
+        self.model_context: dict = {}
 
 async def register_with_hub(state: AppState):
     resources = gather_resources()
     state.parallel_slots = resources["parallel_slots"]
     state.vllm_models = resources["vllm_models"]
     state.mlx_models = resources["mlx_models"]
+    state.embedding_models = resources["embedding_models"]
+    state.model_context = resources["model_context"]
     print(f"Gathered local resources: {resources}")
     print(f"Parallel inference slots: {state.parallel_slots}")
 
@@ -378,7 +466,9 @@ async def heartbeat_loop(state: AppState):
     prev_mlx = None
 
     while True:
-        await asyncio.sleep(5)
+        # Uniform jitter on the 5s heartbeat cadence to avoid thundering-herd
+        # alignment when many agents share a hub clock edge (D036 partial).
+        await asyncio.sleep(5 + random.uniform(0, 1.0))
 
         if not state.is_connected or not state.node_id:
             continue
@@ -513,13 +603,92 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
         )
 
 
+async def _run_embedding_ollama(client: httpx.AsyncClient, state: AppState, task: dict):
+    """Run an Ollama embedding task. Tries the batch-capable `/api/embed`
+    endpoint first (Ollama 0.2+); falls back to per-input `/api/embeddings`
+    when the batch endpoint is missing (404)."""
+    task_id = task["task_id"]
+    model = task.get("model", "nomic-embed-text")
+    payload = task.get("payload", {}) or {}
+    inputs = payload.get("input") or []
+    if not isinstance(inputs, list):
+        inputs = [str(inputs)]
+
+    auth = {"Authorization": f"Bearer {state.node_token}"}
+    submit_url = f"{HUB_URL}/tasks/{state.node_id}/complete/{task_id}"
+
+    print(f"⚙️  [{task_id}] EMBED via ollama ({model}, batch={len(inputs)})...")
+    try:
+        # Preferred path: batch /api/embed.
+        embeddings: list[list[float]] = []
+        prompt_tokens = 0
+        resp = await client.post(
+            "http://localhost:11434/api/embed",
+            json={"model": model, "input": inputs},
+            timeout=120.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            embeddings = data.get("embeddings") or []
+            prompt_tokens = data.get("prompt_eval_count", 0) or 0
+        elif resp.status_code == 404:
+            # Older Ollama: per-input /api/embeddings.
+            for s in inputs:
+                r = await client.post(
+                    "http://localhost:11434/api/embeddings",
+                    json={"model": model, "prompt": s},
+                    timeout=120.0,
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(f"/api/embeddings returned {r.status_code}: {r.text}")
+                rd = r.json()
+                embeddings.append(rd.get("embedding") or [])
+                prompt_tokens += rd.get("prompt_eval_count", 0) or 0
+        else:
+            raise RuntimeError(f"/api/embed returned {resp.status_code}: {resp.text}")
+
+        if len(embeddings) != len(inputs) or any(not isinstance(v, list) for v in embeddings):
+            raise RuntimeError(f"backend returned malformed embeddings for {len(inputs)} inputs")
+
+        await client.post(
+            submit_url,
+            json={
+                "embeddings": embeddings,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 0,
+            },
+            headers=auth,
+        )
+        print(f"✅ [{task_id}] Embedding done. Tokens P:{prompt_tokens} dim={len(embeddings[0]) if embeddings else 0}")
+    except httpx.ReadTimeout:
+        await client.post(
+            submit_url,
+            json={"output": "Failed: ollama embedding timed out", "error": True},
+            headers=auth,
+        )
+    except Exception as e:
+        await client.post(
+            submit_url,
+            json={"output": f"Failed to compute embedding via ollama: {e}", "error": True},
+            headers=auth,
+        )
+
+
 async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dict):
     """Execute one inference task against the appropriate backend and submit the result to the hub."""
     task_id = task['task_id']
     model_to_use = task.get("model", "llama3")
     messages = task.get("messages", [])
+    kind = task.get("kind", "chat")
 
-    # Determine which local backend has this model
+    # Embedding tasks dispatch to a dedicated path — they do not share the
+    # chat-completions code (different request shape, different result type,
+    # no streaming, vLLM/MLX deferred per D028).
+    if kind == "embedding":
+        await _run_embedding_ollama(client, state, task)
+        return
+
+    # Determine which local backend has this model (chat path).
     if model_to_use in state.vllm_models:
         backend = "vllm"
         base_url = VLLM_HOST
@@ -580,9 +749,11 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
             })
             if ollama_resp.status_code == 200:
                 o_data = ollama_resp.json()
-                output_text = o_data.get("message", {}).get("content", "")
-                p_tokens = o_data.get("prompt_eval_count", 0)
-                c_tokens = o_data.get("eval_count", 0)
+                # Defensive: backend may return null content; coerce to ""
+                # so the hub's stored result is a real string (D025 sibling).
+                output_text = (o_data.get("message", {}) or {}).get("content") or ""
+                p_tokens = o_data.get("prompt_eval_count", 0) or 0
+                c_tokens = o_data.get("eval_count", 0) or 0
                 print(f"✅ [{task_id}] Done. Tokens P:{p_tokens} C:{c_tokens}")
             else:
                 output_text = f"Error from ollama chat: {ollama_resp.status_code} - {ollama_resp.text}"
@@ -598,9 +769,9 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
             })
             if ollama_resp.status_code == 200:
                 o_data = ollama_resp.json()
-                output_text = o_data.get("response", "")
-                p_tokens = o_data.get("prompt_eval_count", 0)
-                c_tokens = o_data.get("eval_count", 0)
+                output_text = o_data.get("response") or ""
+                p_tokens = o_data.get("prompt_eval_count", 0) or 0
+                c_tokens = o_data.get("eval_count", 0) or 0
                 print(f"✅ [{task_id}] Done. Tokens P:{p_tokens} C:{c_tokens}")
             else:
                 output_text = f"Error from ollama generate: {ollama_resp.status_code} - {ollama_resp.text}"
@@ -654,7 +825,8 @@ async def task_polling_loop(state: AppState):
         except Exception:
             pass  # heartbeat loop handles disconnect detection
 
-        await asyncio.sleep(5)  # idle backoff — only reached when no tasks were found
+        # Uniform jitter on the idle-poll cadence — same rationale as heartbeat.
+        await asyncio.sleep(5 + random.uniform(0, 1.0))
 
 async def connection_manager(state: AppState):
     """Monitors connection state and re-registers when disconnected.

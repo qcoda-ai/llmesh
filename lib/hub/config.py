@@ -13,7 +13,10 @@ import json
 import os
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "server_config.json")
+# `LLMESH_CONFIG_PATH` env var lets test harnesses (and operators) point the
+# hub at an alternate config file without touching the repo root. Used by the
+# integration test suite to load tests/fixtures/server_config.json.
+_CONFIG_PATH = os.environ.get("LLMESH_CONFIG_PATH") or os.path.join(_PROJECT_ROOT, "server_config.json")
 _LEGACY_KEYS_PATH = os.path.join(_PROJECT_ROOT, "api_keys.json")
 
 # Publicly known API key placeholders. If any of these are still present in the
