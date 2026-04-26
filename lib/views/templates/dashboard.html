@@ -102,6 +102,15 @@
                                     Send to Mesh
                                 </button>
                             </form>
+                            <div id="embeddingModelsBlock" class="mt-3 pt-2 border-top {% if not embedding_models %}d-none{% endif %}">
+                                <div class="form-label fw-semibold small mb-1">Embedding Models</div>
+                                <div id="embeddingModelsList">
+                                    {% for em in embedding_models %}
+                                        <span class="model-pill">{{ em.name }} ({{ em.count }})</span>
+                                    {% endfor %}
+                                </div>
+                                <small class="text-muted">POST to <code>/v1/embeddings</code></small>
+                            </div>
                         </div>
                     </div>
 
@@ -118,7 +127,7 @@
                                 </div>
                                 <small class="text-muted">Header: <code>Authorization: Bearer &lt;key&gt;</code></small>
                             </div>
-                            <div>
+                            <div class="mb-3">
                                 <div class="form-label fw-semibold small mb-1">Anthropic Compatible</div>
                                 <div class="input-group input-group-sm">
                                     <span class="input-group-text bg-light text-muted">POST</span>
@@ -126,6 +135,15 @@
                                            value="{{ base_url }}/v1/messages" readonly onclick="this.select();">
                                 </div>
                                 <small class="text-muted">Header: <code>x-api-key: &lt;key&gt;</code></small>
+                            </div>
+                            <div>
+                                <div class="form-label fw-semibold small mb-1">Embeddings</div>
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text bg-light text-muted">POST</span>
+                                    <input type="text" class="form-control font-monospace text-muted"
+                                           value="{{ base_url }}/v1/embeddings" readonly onclick="this.select();">
+                                </div>
+                                <small class="text-muted">Header: <code>Authorization: Bearer &lt;key&gt;</code></small>
                             </div>
                         </div>
                     </div>
@@ -342,7 +360,29 @@ async function fetchNodes() {
         const data = await fetch('/api/nodes').then(r => r.json());
         updateNodeTable(data);
         updateModelDropdown(data);
+        updateEmbeddingModelsBlock(data);
     } catch (e) { console.error('fetchNodes', e); }
+}
+
+function updateEmbeddingModelsBlock(nodes) {
+    const block = document.getElementById('embeddingModelsBlock');
+    const list = document.getElementById('embeddingModelsList');
+    if (!block || !list) return;
+    let counts = {};
+    nodes.forEach(n => {
+        if (n.last_seen_sec >= 30) return;
+        (n.embedding_models || []).forEach(m => counts[m] = (counts[m] || 0) + 1);
+    });
+    const sorted = Object.entries(counts).map(([name, count]) => ({name, count}))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    if (!sorted.length) {
+        block.classList.add('d-none');
+        list.innerHTML = '';
+        return;
+    }
+    block.classList.remove('d-none');
+    list.innerHTML = sorted.map(({name, count}) =>
+        `<span class="model-pill">${esc(name)} (${count})</span>`).join('');
 }
 
 function updateModelDropdown(nodes) {
@@ -428,6 +468,7 @@ function updateNodeTable(nodes) {
                     ${backendRow('Ollama', n.ollama_available, n.ollama_models)}
                     ${backendRow('vLLM',   n.vllm_available,   n.vllm_models)}
                     ${backendRow('MLX',    n.mlx_available,    n.mlx_models)}
+                    ${backendRow('Embed',  (n.embedding_models || []).length > 0, n.embedding_models)}
                     <div class="text-muted mt-2" style="font-size:0.78rem">
                         Slots: <strong>${n.parallel_slots ?? 1}</strong>&nbsp;·&nbsp;
                         Context: <strong>${n.context_size ?? 8192}</strong>
