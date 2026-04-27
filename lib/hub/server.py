@@ -1326,12 +1326,11 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
     # Collect all available models across the owner's online nodes and their counts
     current_time = time.time()
     model_counts = {}
-    embed_counts: dict[str, int] = {}
     for n in owner_nodes:
         if _node_is_capable(n) and (current_time - n.last_seen < 30):
             # D028: chat dropdown excludes embedding-only models (they cannot
-            # answer /v1/chat/completions). Embeddings surface via separate
-            # `embedding_models` template var below.
+            # answer /v1/chat/completions). Per-node Embed row in node card
+            # surfaces embedding models separately.
             chat_models = (
                 getattr(n.resources, "ollama_models", []) +
                 getattr(n.resources, "vllm_models", []) +
@@ -1339,31 +1338,24 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
             )
             for model in chat_models:
                 model_counts[model] = model_counts.get(model, 0) + 1
-            for em in getattr(n.resources, "embedding_models", []):
-                embed_counts[em] = embed_counts.get(em, 0) + 1
-                
+
     # Sort by count descending, then alphabetically by name
     available_models = [
         {"name": name, "count": count}
         for name, count in sorted(model_counts.items(), key=lambda item: (-item[1], item[0]))
     ]
-    embedding_models = [
-        {"name": name, "count": count}
-        for name, count in sorted(embed_counts.items(), key=lambda item: (-item[1], item[0]))
-    ]
-    
+
     # Calculate base_url from request
     base_url = str(request.base_url).rstrip('/')
-    
+
     return templates.TemplateResponse(
-        "dashboard.html", 
+        "dashboard.html",
         {
-            "request": request, 
-            "nodes": owner_nodes, 
-            "owner_id": owner_id, 
-            "current_time": time.time(), 
+            "request": request,
+            "nodes": owner_nodes,
+            "owner_id": owner_id,
+            "current_time": time.time(),
             "available_models": available_models,
-            "embedding_models": embedding_models,
             "base_url": base_url,
             "version": APP_VERSION
         }
