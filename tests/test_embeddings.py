@@ -82,9 +82,44 @@ def test_embeddings_oversize_batch_413():
 
 
 def test_embeddings_oversize_item_413():
-    big = "a" * (40_000)  # over MAX_INPUT_BYTES=32768
+    """D049: default MAX_INPUT_BYTES is 256 KB; payload above it must 413."""
+    big = "a" * (300_000)  # over MAX_INPUT_BYTES=262144 (D049)
     r = _post_embeddings({"model": "nomic-embed-text", "input": big})
     assert r.status_code == 413, r.text
+
+
+def test_embeddings_67k_passes_default():
+    """D049: 67 KB matches the observed QCoda ENRICHMENT envelope. At the new
+    256 KB default, this must pass (old 32 KB default rejected it)."""
+    payload_67k = "a" * 67_574
+    r = _post_embeddings({"model": "nomic-embed-text", "input": payload_67k})
+    assert r.status_code == 200, f"67 KB payload rejected at default cap: {r.status_code} {r.text}"
+
+
+def test_embeddings_413_structured_body():
+    """D049: 413 response uses structured `error` object (not legacy `detail`)."""
+    big = "a" * (300_000)
+    r = _post_embeddings({"model": "nomic-embed-text", "input": big})
+    assert r.status_code == 413
+    body = r.json()
+    assert "error" in body, f"413 missing structured error: {body}"
+    err = body["error"]
+    assert err["type"] == "payload_too_large"
+    assert err["field"].startswith("input"), err
+    assert err["limit_bytes"] == 262144
+    assert err["actual_bytes"] == 300_000
+
+
+def test_embeddings_oversize_batch_413_structured():
+    """D049: oversize batch 413 also carries structured error."""
+    inputs = ["x"] * 200  # over MAX_BATCH_EMBEDDINGS=128
+    r = _post_embeddings({"model": "nomic-embed-text", "input": inputs})
+    assert r.status_code == 413
+    err = r.json().get("error", {})
+    assert err.get("type") == "payload_too_large"
+    assert err.get("field") == "input"
+    assert err.get("limit_bytes") == 128
+    assert err.get("actual_bytes") == 200
 
 
 def test_embeddings_missing_auth_401():

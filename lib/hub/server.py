@@ -62,9 +62,11 @@ RATE_LIMIT_HEARTBEAT = os.getenv("RATE_LIMIT_HEARTBEAT", "30/minute")
 MODELS_CACHE_TTL = float(os.getenv("MODELS_CACHE_TTL", "10.0"))
 _models_cache: dict[str, tuple[float, dict]] = {}
 
-# Payload bounds (D032). Reject oversize requests at the hub edge so a single
-# pathological client cannot exhaust the event loop's memory budget.
-MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_BYTES", "32768"))
+# Payload bounds (D032; default raised to 256 KB by D049). Reject oversize
+# requests at the hub edge so a single pathological client cannot exhaust the
+# event loop's memory budget. Static cap = DoS defence; dynamic per-model
+# capacity is surfaced separately via GET /v1/limits.
+MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_BYTES", "262144"))
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "200"))
 MAX_BATCH_EMBEDDINGS = int(os.getenv("MAX_BATCH_EMBEDDINGS", "128"))
 
@@ -101,6 +103,29 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONR
     )
 
 
+class PayloadTooLarge(Exception):
+    """D049: structured 413 raised by payload validators. A dedicated exception
+    lets the handler emit `{"error": {...}}` at the top level, distinct from
+    FastAPI's default `{"detail": ...}` envelope."""
+
+    def __init__(self, field: str, limit: int, actual: int):
+        self.field = field
+        self.limit = limit
+        self.actual = actual
+
+
+async def _payload_too_large_handler(request: Request, exc: PayloadTooLarge) -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={"error": {
+            "type": "payload_too_large",
+            "field": exc.field,
+            "limit_bytes": exc.limit,
+            "actual_bytes": exc.actual,
+        }},
+    )
+
+
 app = FastAPI(title="LLMesh Hub")
 
 # Setup Jinja2 templates
@@ -117,6 +142,7 @@ class InferenceRequest(BaseModel):
     messages: Optional[List[Dict[str, str]]] = None # Added for Anthropic API
     model: str = "llama3"
     num_ctx: Optional[int] = None
+    max_tokens: Optional[int] = None
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -152,6 +178,7 @@ limiter = Limiter(
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
+app.add_exception_handler(PayloadTooLarge, _payload_too_large_handler)
 
 STREAM_CHUNK_TIMEOUT = float(os.getenv("STREAM_CHUNK_TIMEOUT", "300.0"))
 DEFAULT_CONTEXT_WINDOW = os.getenv("DEFAULT_CONTEXT_WINDOW")
@@ -208,32 +235,47 @@ def _node_model_context(n, model: str) -> int:
     return getattr(n.resources, "context_size", 8192)
 
 
+def _payload_too_large(field: str, limit: int, actual: int) -> PayloadTooLarge:
+    return PayloadTooLarge(field=field, limit=limit, actual=actual)
+
+
 def _validate_chat_payload(messages: list[dict]) -> None:
-    """D032: reject oversize chat payloads before they hit the routing pipeline."""
+    """D032/D049: reject oversize chat payloads before they hit the routing pipeline."""
     if len(messages) > MAX_MESSAGES:
-        raise HTTPException(status_code=413, detail=f"messages exceeds MAX_MESSAGES={MAX_MESSAGES}")
-    for m in messages:
+        raise _payload_too_large(field="messages", limit=MAX_MESSAGES, actual=len(messages))
+    for idx, m in enumerate(messages):
         content = m.get("content", "") if isinstance(m, dict) else ""
         if isinstance(content, list):
             # Flattened later; size-bound the assembled text.
             content = "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
-        if isinstance(content, str) and len(content.encode("utf-8")) > MAX_INPUT_BYTES:
-            raise HTTPException(status_code=413, detail=f"message content exceeds MAX_INPUT_BYTES={MAX_INPUT_BYTES}")
+        if isinstance(content, str):
+            n = len(content.encode("utf-8"))
+            if n > MAX_INPUT_BYTES:
+                raise _payload_too_large(
+                    field=f"messages[{idx}].content",
+                    limit=MAX_INPUT_BYTES,
+                    actual=n,
+                )
 
 
 def _validate_embeddings_payload(inputs: list[str]) -> None:
-    """D032: reject oversize embedding batches and per-input strings."""
+    """D032/D049: reject oversize embedding batches and per-input strings."""
     if not inputs:
         raise HTTPException(status_code=400, detail="`input` must be a non-empty string or non-empty list of strings")
     if len(inputs) > MAX_BATCH_EMBEDDINGS:
-        raise HTTPException(status_code=413, detail=f"batch exceeds MAX_BATCH_EMBEDDINGS={MAX_BATCH_EMBEDDINGS}")
-    for s in inputs:
+        raise _payload_too_large(field="input", limit=MAX_BATCH_EMBEDDINGS, actual=len(inputs))
+    for idx, s in enumerate(inputs):
         if not isinstance(s, str):
             raise HTTPException(status_code=400, detail="every `input` element must be a string")
         if not s:
             raise HTTPException(status_code=400, detail="`input` strings must be non-empty")
-        if len(s.encode("utf-8")) > MAX_INPUT_BYTES:
-            raise HTTPException(status_code=413, detail=f"input element exceeds MAX_INPUT_BYTES={MAX_INPUT_BYTES}")
+        n = len(s.encode("utf-8"))
+        if n > MAX_INPUT_BYTES:
+            raise _payload_too_large(
+                field=f"input[{idx}]",
+                limit=MAX_INPUT_BYTES,
+                actual=n,
+            )
 
 
 def _capability_predicate_for_kind(kind: tasks.TaskKind):
@@ -568,7 +610,12 @@ def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskRespons
     task = tasks.Task(
         task_id=task_id,
         kind=tasks.TaskKind.CHAT,
-        payload={"messages": req.messages, "prompt": req.prompt, "num_ctx": num_ctx},
+        payload={
+            "messages": req.messages,
+            "prompt": req.prompt,
+            "num_ctx": num_ctx,
+            "max_tokens": req.max_tokens,
+        },
         model=req.model,
         owner_id=req.owner_id,
     )
@@ -647,6 +694,7 @@ async def get_pending_tasks_for_node(request: Request, node_id: str, _: None = D
             entry["prompt"] = t.prompt
             entry["messages"] = t.messages
             entry["num_ctx"] = t.num_ctx
+            entry["max_tokens"] = t.max_tokens
         out.append(entry)
     return out
 
@@ -684,6 +732,14 @@ async def stream_task_chunk(
             task.stream_queue.put_nowait(item)
 
     if body.done:
+        # D045: per CF-5 contract from D040+D041, agents may piggyback the
+        # final batch onto the done frame as a single POST `{chunk: "tail",
+        # done: true}`. Deliver the chunk content BEFORE the close sentinel
+        # so SSE consumers receive every token. Empty `chunk` on done is the
+        # common case (Ollama path, batcher with empty buffer at done time)
+        # and is safe to skip.
+        if body.chunk:
+            _put_or_drop_oldest(body.chunk)
         task.prompt_tokens = body.prompt_tokens
         task.completion_tokens = body.completion_tokens
         task.status = "completed"
@@ -847,7 +903,11 @@ async def get_nodes_for_owner(
     result = []
     for n in owner_nodes:
         result.append({
-            "node_id": n.node_id[:8] + "...",
+            # Send full node_id so dashboard renders operator-supplied
+            # labels (D048) at full length. Prior `[:8] + "..."` truncation
+            # made auto-fingerprints (`node_<16hex>`) marginally readable
+            # but defeats LLMESH_NODE_ID. CSS handles any overflow.
+            "node_id": n.node_id,
             "node_id_full": n.node_id,
             "cpu_cores": n.resources.cpu_cores,
             "ram_gb": n.resources.ram_gb,
@@ -1001,6 +1061,61 @@ async def list_models(request: Request, authorization: str | None = Header(None)
         _models_cache[owner_id] = (now_mono + MODELS_CACHE_TTL, response)
     return response
 
+
+# Approximate chars-per-token for the byte-budget estimate surfaced on
+# /v1/limits. 4 is the OpenAI/Anthropic rule-of-thumb for English text. Used
+# only for the informational `context_bytes_estimate` — actual validation
+# is byte-exact against MAX_INPUT_BYTES.
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+@app.get("/v1/limits")
+@limiter.limit(RATE_LIMIT_LIST)
+async def list_limits(request: Request, authorization: str | None = Header(None)):
+    """D049: discoverable payload bounds.
+
+    Static block: global DoS-defence caps enforced at request edge.
+    `models` block: per-model context capacity derived from connected-node
+    `model_context`/`context_size`, scoped to the calling owner. Empty when
+    no capable nodes are online. Informational only — clients use it to
+    pre-clamp before sending; validation is still byte-exact against
+    `max_input_bytes`."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Authorization header")
+    api_key = authorization.replace("Bearer ", "")
+    owner_id = storage.authenticate_owner(api_key)
+    if not owner_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+
+    per_model_ctx: dict[str, int] = {}
+    for n in storage.get_all_nodes():
+        if n.owner_id != owner_id:
+            continue
+        node_default_ctx = getattr(n.resources, "context_size", 8192)
+        per_model = getattr(n.resources, "model_context", {}) or {}
+        for attr in ("ollama_models", "vllm_models", "mlx_models", "embedding_models"):
+            for m in getattr(n.resources, attr, []) or []:
+                ctx = per_model.get(m, node_default_ctx) or 0
+                if ctx > 0:
+                    per_model_ctx[m] = max(per_model_ctx.get(m, 0), ctx)
+
+    models_block = {
+        m: {
+            "context_tokens": ctx,
+            "context_bytes_estimate": min(MAX_INPUT_BYTES, ctx * _CHARS_PER_TOKEN_ESTIMATE),
+        }
+        for m, ctx in per_model_ctx.items()
+    }
+
+    return {
+        "max_input_bytes": MAX_INPUT_BYTES,
+        "max_messages": MAX_MESSAGES,
+        "max_batch_embeddings": MAX_BATCH_EMBEDDINGS,
+        "stream_queue_max": STREAM_QUEUE_MAX,
+        "models": models_block,
+    }
+
+
 async def _process_chat_completion(
     req_model: str,
     messages: list[dict],
@@ -1008,6 +1123,7 @@ async def _process_chat_completion(
     session_id: str | None = None,
     want_stream: bool = False,
     num_ctx: int | None = None,
+    max_tokens: int | None = None,
 ) -> tuple:
     owner_id = storage.authenticate_owner(api_key)
     if not owner_id:
@@ -1027,7 +1143,8 @@ async def _process_chat_completion(
         owner_id=owner_id,
         model=req_model,
         messages=full_messages,
-        num_ctx=num_ctx
+        num_ctx=num_ctx,
+        max_tokens=max_tokens,
     )
 
     try:
@@ -1087,7 +1204,8 @@ async def openai_chat_completions(
     messages = [{"role": m.role, "content": extract_content(m.content)} for m in req.messages]
 
     task, err_resp, session_id, owner_id, stored_history, incoming_messages = await _process_chat_completion(
-        req.model, messages, api_key, x_session_id, want_stream=req.stream, num_ctx=req.num_ctx
+        req.model, messages, api_key, x_session_id, want_stream=req.stream,
+        num_ctx=req.num_ctx, max_tokens=req.max_tokens
     )
     if err_resp:
         return err_resp
@@ -1174,7 +1292,8 @@ async def anthropic_messages(
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     task, err_resp, session_id, _owner_id, _stored_history, _incoming = await _process_chat_completion(
-        req.model, messages, x_api_key, x_session_id, num_ctx=req.num_ctx
+        req.model, messages, x_api_key, x_session_id,
+        num_ctx=req.num_ctx, max_tokens=req.max_tokens,
     )
     if err_resp:
         return err_resp

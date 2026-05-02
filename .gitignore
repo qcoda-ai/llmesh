@@ -86,3 +86,8 @@ nodeclient.service
 llmesh.service
 llmesh-nginx.conf
 !*.example
+
+# Lab run artefacts — operator-generated trend data, not source.
+# Track only `.gitkeep` so directory persists.
+.qcoda/labs/*/runs/*.json
+!.qcoda/labs/*/runs/.gitkeep

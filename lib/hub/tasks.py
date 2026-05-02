@@ -73,6 +73,10 @@ class Task:
     def num_ctx(self) -> int | None:
         return self.payload.get("num_ctx") if self.kind is TaskKind.CHAT else None
 
+    @property
+    def max_tokens(self) -> int | None:
+        return self.payload.get("max_tokens") if self.kind is TaskKind.CHAT else None
+
 
 # Per-node task lists (for pending task polling by nodes)
 _node_tasks: Dict[str, List[Task]] = {}

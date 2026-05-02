@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# pre-commit hook — Ledger Law (warn-only) + secrets scan (blocking).
+# Installed via: bash scripts/install_git_hooks.sh
+# Source of truth: scripts/git_hooks/pre-commit (versioned).
+
+set -e
+
+# 1. Ledger Law — warn-only during D042 first-week rollout.
+#    To flip to blocking: change the `if !` block to `python ... || exit 1`
+#    and log a follow-up decision.
+if ! python scripts/validate_decisions.py; then
+    echo ""
+    echo "  ⚠  Ledger Law check failed — currently WARN-ONLY (D042 first-week mode)."
+    echo "  ⚠  Resolve the violation; this hook will flip to BLOCKING in a future decision."
+    echo ""
+fi
+
+# 2. Secrets scan — gitleaks against staged changes (always blocking).
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo ""
+    echo "─────────────────────────────────────────────────────"
+    echo "  ❌ pre-commit BLOCKED — gitleaks not installed"
+    echo "─────────────────────────────────────────────────────"
+    echo ""
+    echo "  Install on macOS:    brew install gitleaks"
+    echo "  Install elsewhere:   https://github.com/gitleaks/gitleaks#installing"
+    echo ""
+    echo "  Bypass (only if you know the diff is clean):"
+    echo "    git commit --no-verify ..."
+    echo ""
+    exit 1
+fi
+
+GITLEAKS_OUT=$(mktemp)
+trap 'rm -f "$GITLEAKS_OUT"' EXIT
+if ! gitleaks protect --staged --redact --no-banner --config .gitleaks.toml >"$GITLEAKS_OUT" 2>&1; then
+    echo ""
+    echo "─────────────────────────────────────────────────────"
+    echo "  ❌ pre-commit BLOCKED — gitleaks found a secret"
+    echo "─────────────────────────────────────────────────────"
+    echo ""
+    cat "$GITLEAKS_OUT"
+    echo ""
+    echo "  Remove the secret, rotate the credential if it was real,"
+    echo "  and re-stage. If the hit is a known-safe fixture, add it"
+    echo "  to .gitleaks.toml [allowlist] paths or fingerprints."
+    echo ""
+    exit 1
+fi

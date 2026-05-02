@@ -54,12 +54,62 @@ VLLM_HEALTH_PATH = os.getenv("VLLM_HEALTH_PATH", "/health")
 # configurations — or when you want to clamp the advertised window below
 # the model's actual capability. See decisions.md D015.
 VLLM_MAX_CONTEXT = int(os.getenv("VLLM_MAX_CONTEXT", "0")) or None
+# Master gate for vLLM real per-token streaming (D040). Default ON per D044
+# after manual real-vLLM verification on operator hardware (token-by-token
+# rendering, usage counts correct, batcher auto-tune working). Set to "false"
+# / "0" / "no" to fall back to the blocking + D018 bridge path.
+VLLM_STREAMING_ENABLED = os.getenv("VLLM_STREAMING_ENABLED", "true").lower() in ("true", "1", "yes")
 MLX_HOST = os.getenv("MLX_HOST")              # None unless explicitly set
+
+# Allow direct-script invocation (`python lib/agent/client.py`) in addition
+# to module invocation (`python -m lib.agent.client`). Direct invocation
+# puts `lib/agent/` on sys.path, not the repo root; absolute imports below
+# fail with ModuleNotFoundError. Inject repo root before the absolute imports.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from lib.agent.streaming_batcher import (
+    StreamBatcher,
+    StreamBatcherAborted,
+    resolve_batcher_config,
+)
+
+
+class _StreamCancelled(Exception):
+    """Hub returned 410 Gone — consumer disconnected, abort streaming."""
 
 
 def _vllm_headers() -> dict:
     """Bearer-auth header for vLLM-path requests, or empty if no key set."""
     return {"Authorization": f"Bearer {VLLM_API_KEY}"} if VLLM_API_KEY else {}
+
+
+async def _iter_sse_events(byte_stream):
+    """Async generator over httpx aiter_bytes() yielding SSE event payloads.
+
+    Buffers bytes until the `\\n\\n` event terminator (CF-1 — single SSE
+    event can span multiple lines, and `httpx.aiter_lines()` returns one
+    line at a time with no event reassembly). For each complete event,
+    concatenates `data:` lines and yields the resulting payload string.
+
+    Skips heartbeat comment lines (`: …`), `event:`, `id:`, `retry:` lines.
+    Returns the literal string `"[DONE]"` for the SSE terminator sentinel
+    so callers can string-compare without attempting `json.loads` on it.
+    """
+    buf = b""
+    async for chunk in byte_stream:
+        buf += chunk
+        while b"\n\n" in buf:
+            event, buf = buf.split(b"\n\n", 1)
+            data_lines = []
+            for line in event.split(b"\n"):
+                if not line or line.startswith(b":"):
+                    continue
+                if line.startswith(b"data:"):
+                    data_lines.append(line[5:].lstrip())
+            if data_lines:
+                yield b"\n".join(data_lines).decode("utf-8", errors="replace")
 
 def _load_or_create_node_salt() -> str:
     """Persistent random salt, created on first run and reused forever.
@@ -102,7 +152,44 @@ def _load_or_create_node_salt() -> str:
         return secrets.token_hex(16)
 
 
+_NODE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,63}$")
+
+
+def _resolve_operator_node_id() -> str | None:
+    """If LLMESH_NODE_ID is set and valid, return it. Otherwise None.
+
+    Per D048 — operators may override the auto-generated GUID-style fingerprint
+    with a human-readable label (e.g. hostname) so the dashboard, logs, and
+    URL paths show which physical machine is which. Validation: must match
+    `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$` so the value is safe to embed in
+    `/tasks/{node_id}/...` URL paths and in log lines without quoting.
+
+    Operator owns collision avoidance: setting the same value on two agents
+    pointing at the same hub causes the second registration to inherit the
+    first's token (existing D021 hub behavior). Document, don't prevent.
+    """
+    raw = os.getenv("LLMESH_NODE_ID")
+    if not raw:
+        return None
+    if not _NODE_ID_RE.match(raw):
+        print(
+            f"⚠️  LLMESH_NODE_ID={raw!r} ignored — must match "
+            f"[a-zA-Z0-9][a-zA-Z0-9_.-]{{0,63}}; falling back to fingerprint",
+            file=sys.stderr,
+        )
+        return None
+    return raw
+
+
 def compute_node_fingerprint() -> str:
+    """Return the agent's node identifier.
+
+    If `LLMESH_NODE_ID` is set and validates, use it verbatim (D048).
+    Otherwise compute the salted hash fingerprint (D021).
+    """
+    operator_id = _resolve_operator_node_id()
+    if operator_id is not None:
+        return operator_id
     salt = _load_or_create_node_salt()
     raw = (
         f"{socket.gethostname()}|{platform.system()}|{platform.machine()}"
@@ -603,6 +690,156 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
         )
 
 
+async def _run_streaming_vllm(client: httpx.AsyncClient, state: AppState, task: dict):
+    """Stream vLLM inference token-by-token, batching POSTs to the hub (D040+D041).
+
+    Differences from the Ollama path:
+    - vLLM speaks OpenAI-shaped SSE on /v1/chat/completions, not JSONL on
+      /api/chat. Parser uses `_iter_sse_events()` over `aiter_bytes()`.
+    - State machine for the trailing frames: vLLM emits `finish_reason`,
+      then a `usage` chunk (only when `stream_options.include_usage=true`),
+      then the `[DONE]` sentinel. Done frame is held until `[DONE]`.
+    - Tokens are funneled through `StreamBatcher` so fast vLLM (50-200 tok/s)
+      does not flood hub `/stream` with 1 POST per token.
+    - Streaming path NEVER calls `/complete` (CF-6). Mid-stream errors emit a
+      final chunk POST with the error message and a done sentinel; the D018
+      bridge stays inactive on this path.
+    - `num_ctx` per-request override is documented as ignored (D015 limitation,
+      vLLM context fixed at server startup); a one-shot warning is logged.
+    """
+    task_id = task["task_id"]
+    model = task.get("model", "")
+    messages = task.get("messages") or [{"role": "user", "content": task.get("prompt", "")}]
+    hub_stream_url = f"{HUB_URL}/tasks/{state.node_id}/{task_id}/stream"
+    auth = {"Authorization": f"Bearer {state.node_token}"}
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if task.get("max_tokens"):
+        payload["max_tokens"] = task["max_tokens"]
+    headers = _vllm_headers()
+
+    if task.get("num_ctx"):
+        print(f"⚠️  [{task_id}] num_ctx={task.get('num_ctx')} ignored on vLLM — context fixed at server startup (D015)")
+
+    print(f"⚙️  [{task_id}] STREAMING via vllm ({model})...")
+
+    cancelled = False
+    pt = ct = 0
+    delta_count = 0
+    finish_reason = None
+
+    async def _post_chunk(chunk_text: str, *, done: bool, prompt_tokens: int = 0, completion_tokens: int = 0):
+        nonlocal cancelled
+        body = {
+            "chunk": chunk_text, "done": done,
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+        }
+        resp = await client.post(hub_stream_url, headers=auth, json=body)
+        if resp.status_code == 410:
+            cancelled = True
+            raise _StreamCancelled()
+        if resp.status_code != 200:
+            print(f"⚠️  [{task_id}] Hub returned {resp.status_code} during streaming")
+
+    async def flush_callback(*, chunk, done, **meta):
+        await _post_chunk(
+            chunk, done=done,
+            prompt_tokens=meta.get("prompt_tokens", 0),
+            completion_tokens=meta.get("completion_tokens", 0),
+        )
+
+    cfg = resolve_batcher_config()
+    batcher = StreamBatcher(flush_callback, **cfg)
+    batcher.start_timer()
+
+    try:
+        async with client.stream(
+            "POST", f"{VLLM_HOST}/v1/chat/completions",
+            json=payload, headers=headers, timeout=600.0,
+        ) as resp:
+            if resp.status_code != 200:
+                err_bytes = await resp.aread()
+                err_text = f"vLLM stream open failed: {resp.status_code} - {err_bytes.decode(errors='replace')[:200]}"
+                print(f"❌ [{task_id}] {err_text}")
+                await _post_chunk(err_text, done=False)
+                await _post_chunk("", done=True)
+                return
+
+            async for raw in _iter_sse_events(resp.aiter_bytes()):
+                if cancelled:
+                    return
+                if raw == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if "error" in evt:
+                    err_msg = json.dumps(evt["error"])
+                    print(f"❌ [{task_id}] vLLM error frame: {err_msg}")
+                    await batcher.flush(done=False)
+                    await _post_chunk(f"\n[vLLM error: {err_msg}]", done=False)
+                    break
+                if evt.get("usage"):
+                    u = evt["usage"]
+                    pt = u.get("prompt_tokens", 0) or 0
+                    ct = u.get("completion_tokens", 0) or 0
+                choices = evt.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    delta_count += 1
+                    await batcher.add(content)
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+        # Stream consumed cleanly. HP-1: estimate tokens_c from delta count
+        # if vLLM did not emit a usage chunk (older vLLM, or stream_options
+        # silently ignored).
+        if pt == 0 and ct == 0 and delta_count > 0:
+            print(f"⚠️  [{task_id}] vLLM did not emit usage chunk — estimating tokens_c={delta_count} from delta count")
+            ct = delta_count
+        await batcher.flush(done=True, prompt_tokens=pt, completion_tokens=ct)
+        print(
+            f"✅ [{task_id}] vLLM stream complete. P:{pt} C:{ct} finish={finish_reason} "
+            f"batches={batcher.stats['flushes']} final_size={batcher.current_size}"
+        )
+
+    except _StreamCancelled:
+        print(f"🛑 [{task_id}] Stream cancelled by hub")
+    except StreamBatcherAborted as e:
+        print(f"❌ [{task_id}] Batcher aborted: {e}")
+        try:
+            await _post_chunk(f"\n[Stream aborted: {e}]", done=False)
+            await _post_chunk("", done=True, prompt_tokens=pt, completion_tokens=delta_count or ct)
+        except Exception:
+            pass
+    except (httpx.ReadTimeout, httpx.HTTPError, asyncio.TimeoutError) as e:
+        print(f"❌ [{task_id}] vLLM stream interrupted: {e}")
+        try:
+            await _post_chunk(f"\n[Stream interrupted: {e}]", done=False)
+            await _post_chunk("", done=True, prompt_tokens=pt, completion_tokens=delta_count or ct)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"❌ [{task_id}] Unexpected error in vLLM stream: {e}")
+        try:
+            await _post_chunk(f"\n[Stream error: {e}]", done=False)
+            await _post_chunk("", done=True, prompt_tokens=pt, completion_tokens=delta_count or ct)
+        except Exception:
+            pass
+    finally:
+        await batcher.close()
+
+
 async def _run_embedding_ollama(client: httpx.AsyncClient, state: AppState, task: dict):
     """Run an Ollama embedding task. Tries the batch-capable `/api/embed`
     endpoint first (Ollama 0.2+); falls back to per-input `/api/embeddings`
@@ -683,7 +920,7 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
 
     # Embedding tasks dispatch to a dedicated path — they do not share the
     # chat-completions code (different request shape, different result type,
-    # no streaming, vLLM/MLX deferred per D028).
+    # no streaming; embedding-on-vLLM/MLX deferred per D028).
     if kind == "embedding":
         await _run_embedding_ollama(client, state, task)
         return
@@ -701,13 +938,19 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
 
     print(f"📥 Task {task_id}: model='{model_to_use}' backend='{backend}'")
 
-    # Streaming dispatch — Ollama only; vLLM and mlx fall back to blocking (beta)
+    # Streaming dispatch — Ollama always, vLLM behind VLLM_STREAMING_ENABLED
+    # (D040). MLX still falls back to blocking (D018 bridge surfaces the
+    # result as a single SSE frame).
     if task.get("stream"):
         if backend == "ollama":
             await _run_streaming_ollama(client, state, task)
             return
+        elif backend == "vllm" and VLLM_STREAMING_ENABLED:
+            await _run_streaming_vllm(client, state, task)
+            return
         else:
-            print(f"⚠️  [{task_id}] Streaming requested but {backend} is beta — falling back to blocking inference")
+            reason = "MLX is beta" if backend == "mlx" else f"{backend} streaming disabled (VLLM_STREAMING_ENABLED={VLLM_STREAMING_ENABLED})"
+            print(f"⚠️  [{task_id}] Streaming requested but {reason} — falling back to blocking inference")
 
     output_text = ""
     p_tokens = c_tokens = 0
@@ -719,13 +962,16 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
             if not messages:
                 messages = [{"role": "user", "content": task.get("prompt", "")}]
             print(f"⚙️  [{task_id}] CHAT via {backend} ({model_to_use})...")
+            req_body = {
+                "model": model_to_use,
+                "messages": messages,
+                "stream": False,
+            }
+            if task.get("max_tokens"):
+                req_body["max_tokens"] = task["max_tokens"]
             resp = await client.post(
                 f"{base_url}/v1/chat/completions",
-                json={
-                    "model": model_to_use,
-                    "messages": messages,
-                    "stream": False,
-                },
+                json=req_body,
                 headers=_vllm_headers() if backend == "vllm" else {},
             )
             if resp.status_code == 200:

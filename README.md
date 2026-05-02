@@ -59,6 +59,16 @@ Our project history reflects ongoing architectural evolution, particularly focus
    pip install '.[dev]'
    ```
 
+4. **Install git hooks** — Ledger Law check + gitleaks secrets scan:
+   ```bash
+   bash scripts/install_git_hooks.sh
+   ```
+   Pre-commit will refuse to run without `gitleaks` installed locally. On macOS:
+   ```bash
+   brew install gitleaks
+   ```
+   See `.qcoda/CONVENTIONS.md` § Enforcement for the full hook details.
+
 ### 1. Start the LLMesh Hub
 
 The Hub uses FastAPI and Uvicorn. Copy the provided example config and edit it with your own API keys:
@@ -127,13 +137,16 @@ LLMesh includes a cross-platform system tray application that runs the agent pur
 > |---|---|---|
 > | `HUB_URL` | `http://127.0.0.1:8000` | Hub address the agent registers with |
 > | `LLMESH_API_KEY` | — | API key for authenticating with the hub |
+> | `LLMESH_NODE_ID` | _(auto-fingerprint)_ | Optional human-readable node ID (e.g. hostname). Default is the salted-hash fingerprint `node_<16hex>` (D021). Set to a label like `gpu-host-1` to make logs and the dashboard show which machine is which. Must match `[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}`. Operator owns collision avoidance — same value on two agents = second inherits first's token. See decisions.md D048. |
 > | `OLLAMA_NUM_CTX` | `8192` | Context window passed to Ollama on every inference call. Also used as the fallback `context_size` reported to the hub when vLLM is the only active backend and its window is unknown. |
 > | `VLLM_HOST` | _(disabled)_ | Base URL for an OpenAI-compatible vLLM server (or any compatible endpoint — host and port, optionally a path subroute, e.g. `http://gpu.internal:8001` or `https://proxy.example.com/litellm`). Set to enable the vLLM backend. |
 > | `VLLM_API_KEY` | _(none)_ | Optional bearer token attached to every request against `VLLM_HOST`. Plain local vLLM does not need this; set it for hardened reverse-proxied vLLM or LiteLLM Proxy. See [docs/integrations/litellm.md](docs/integrations/litellm.md). |
 > | `VLLM_HEALTH_PATH` | `/health` | Path the agent probes for vLLM liveness. LiteLLM users should set this to `/health/liveliness` because LiteLLM's `/health` runs a real upstream model probe and is too heavy for a 2-second liveness check. |
 > | `VLLM_MAX_CONTEXT` | _(auto-detect)_ | Optional explicit override for the vLLM context window the agent reports to the hub. By default the agent auto-detects this from `max_model_len` in vLLM's `/v1/models` response. Set this when running behind a proxy that strips the field, or to clamp the advertised window below the model's actual capability. |
+> | `VLLM_STREAMING_ENABLED` | `true` | Master gate for vLLM real per-token streaming (D040 implementation, default flipped ON in D044 after operator verification). Set to `false` to fall back to the blocking + D018 bridge path (single-frame SSE delivery). |
 > | `MLX_HOST` | _(disabled)_ | Base URL for a local MLX server. Set to enable MLX backend. |
 > | `OLLAMA_PARALLEL_SLOTS` | _(auto)_ | Override auto-detected concurrent inference slot count |
+> | `STREAM_BATCH_FIXED` | _(unset)_ | Pin the agent's stream-batch size to a fixed N and disable adaptive auto-tune. Useful for load testing (`=1`), debug (`=1`), conservative production (`=20`), or pre-characterized fast clusters (`=50`). See `STREAM_BATCH_*` in `.env.example` and decisions.md D041 for the full set of adaptive batching tunables (`STREAM_BATCH_INITIAL`, `STREAM_BATCH_TIME_MS`, `STREAM_BATCH_TARGET_PPS`, `STREAM_BATCH_MIN`, `STREAM_BATCH_MAX`, `STREAM_BATCH_MAX_BUFFER`). |
 
 #### Backend setup notes
 
@@ -230,9 +243,9 @@ On first startup, the hub downloads a small GGUF model (~300 MB) from HuggingFac
 | `compress.model_repo` | `COMPRESS_MODEL_REPO` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | HuggingFace repo ID |
 | `stream.chunk_timeout` | `STREAM_CHUNK_TIMEOUT` | `120.0` | Max seconds between tokens before timeout |
 | — | `MODELS_CACHE_TTL` | `10.0` | Seconds to cache `GET /v1/models` per owner. `0` disables. See D027. |
-| — | `MAX_INPUT_BYTES` | `32768` | Max bytes per chat message content / per embedding input string. Overflow → 413. See D032. |
-| — | `MAX_MESSAGES` | `200` | Max messages per chat request. Overflow → 413. See D032. |
-| — | `MAX_BATCH_EMBEDDINGS` | `128` | Max input strings per `/v1/embeddings` request. Overflow → 413. See D032. |
+| — | `MAX_INPUT_BYTES` | `262144` | Max bytes per chat message content / per embedding input string. Overflow → 413 (structured `error` body). See D032 / D049. |
+| — | `MAX_MESSAGES` | `200` | Max messages per chat request. Overflow → 413. See D032 / D049. |
+| — | `MAX_BATCH_EMBEDDINGS` | `128` | Max input strings per `/v1/embeddings` request. Overflow → 413. See D032 / D049. |
 | — | `STREAM_QUEUE_MAX` | `256` | Bounded SSE chunk queue size (drop-oldest on overflow). See D033. |
 | — | `DEFAULT_EMBEDDING_MODEL` | `nomic-embed-text` | Model used when `/v1/embeddings` omits `model`. See D028. |
 | — | `LLMESH_CONFIG_PATH` | _(repo root `server_config.json`)_ | Override path to the hub config file (used by the test suite). |
@@ -359,7 +372,7 @@ resp = client.embeddings.create(model="nomic-embed-text", input=["alpha", "beta"
 vectors = [d.embedding for d in resp.data]
 ```
 
-Bounds (configurable via env): `MAX_INPUT_BYTES=32768`, `MAX_BATCH_EMBEDDINGS=128`. Overflow returns `413`. Empty input returns `400`. No node serving the requested embedding model returns `503` with a hint.
+Bounds (configurable via env): `MAX_INPUT_BYTES=262144` (256 KB; D049), `MAX_BATCH_EMBEDDINGS=128`. Overflow returns `413` with a structured body: `{"error": {"type": "payload_too_large", "field": "input[N]", "limit_bytes": L, "actual_bytes": A}}`. Empty input returns `400`. No node serving the requested embedding model returns `503` with a hint. Discover bounds at runtime via `GET /v1/limits`.
 
 ### Anthropic-Compatible (`/v1/messages`)
 

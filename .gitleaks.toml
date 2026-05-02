@@ -1,0 +1,53 @@
+# Gitleaks config — runs in pre-commit (scripts/git_hooks/pre-commit) and
+# can be run manually via `gitleaks protect --staged --config .gitleaks.toml`.
+#
+# Strategy: extend the upstream default ruleset (which covers AWS, GCP, GitHub,
+# Bitbucket, Slack, Stripe, JWT, generic API keys, etc.) and add a project-
+# specific allowlist for known-safe fixtures + example values.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "LLMesh safe fixtures + example values"
+
+# Paths that legitimately carry placeholder secrets (test data, docs, examples,
+# operator templates). Prefer narrowing to a specific file rather than a whole
+# directory.
+paths = [
+    '''(?i)tests?/.*fixture.*''',
+    '''(?i)tests?/.*\.yaml''',
+    '''(?i)tests?/.*\.json''',
+    '''(?i)\.env\.example$''',
+    '''(?i)docs/.*\.md$''',
+    '''(?i)\.qcoda/.*\.md$''',
+    '''(?i)README(\..*)?$''',
+    '''(?i)CHANGELOG(\..*)?$''',
+    # Operator deployment templates — D016 .example pattern.
+    '''(?i).*\.example$''',
+    '''(?i).*\.example\.[a-z]+$''',
+    '''(?i)server_config\.example\.json$''',
+    '''(?i)com\.qcoda\.mesh\.plist\.example$''',
+    '''(?i)nodeclient\.service\.example$''',
+    '''(?i)llmesh\.service\.example$''',
+    '''(?i)llmesh-nginx\.conf\.example$''',
+]
+
+# Specific regex matches that are known-safe — placeholder strings the
+# default ruleset would otherwise flag. Keep this list short; prefer
+# fixing the value to be obviously fake (e.g. `sk-replace-me`) over adding
+# allowlist entries.
+regexes = [
+    '''sk-replace-me[A-Za-z0-9_-]*''',          # vLLM/LiteLLM placeholder
+    '''sk-test-[A-Za-z0-9_]+''',                # OpenAI test prefix
+    '''AKIAIOSFODNN7EXAMPLE''',                 # AWS docs example access key
+    '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',  # AWS docs example secret
+    '''change-me-strong-password''',            # default placeholder password
+    '''changeme[0-9]*''',                       # default placeholder password
+    '''your-api-key''',                         # README placeholder
+]
+
+# Specific commit fingerprints to ignore — only add when a known-safe
+# commit was already flagged (use the fingerprint gitleaks prints on a hit).
+# Format: "<commit>:<file>:<rule-id>:<line>"
+# stopwords = []
