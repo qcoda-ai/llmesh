@@ -80,6 +80,7 @@
                         <div class="card-header bg-dark text-white">Request AI Inference</div>
                         <div class="card-body">
                             <form action="/dashboard/request_inference" method="post">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                                 <div class="mb-3">
                                     <label for="model" class="form-label">Model</label>
                                     <select class="form-select form-select-sm" id="model" name="model" required>
@@ -105,6 +106,54 @@
                         </div>
                     </div>
 
+                    {% if image_models %}
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header bg-success text-white">Generate Image (D064)</div>
+                        <div class="card-body">
+                            <form action="/dashboard/request_image" method="post">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <div class="mb-3">
+                                    <label for="img_model" class="form-label">Model</label>
+                                    <select class="form-select form-select-sm" id="img_model" name="model" required>
+                                        {% for m in image_models %}
+                                        <option value="{{ m }}">{{ m }}</option>
+                                        {% endfor %}
+                                    </select>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="img_prompt" class="form-label">Prompt</label>
+                                    <textarea class="form-control form-control-sm" id="img_prompt" name="prompt"
+                                              rows="3" placeholder="e.g. A red apple on a wooden table, photorealistic"
+                                              required></textarea>
+                                </div>
+                                <div class="row g-2 mb-3">
+                                    <div class="col-6">
+                                        <label for="img_size" class="form-label small">Size</label>
+                                        <select class="form-select form-select-sm" id="img_size" name="size">
+                                            <option value="square" selected>Square</option>
+                                            <option value="portrait">Portrait</option>
+                                            <option value="landscape">Landscape</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-6">
+                                        <label for="img_quality" class="form-label small">Speed</label>
+                                        <select class="form-select form-select-sm" id="img_quality" name="quality">
+                                            <option value="draft" selected>Draft (fast)</option>
+                                            <option value="quality">Quality (slow)</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <button type="submit" class="btn btn-success btn-sm w-100">
+                                    Generate Image
+                                </button>
+                                <small class="text-muted d-block mt-2">
+                                    No content filter shipped &mdash; operator policy applies. See <code>docs/image_gen.md</code>.
+                                </small>
+                            </form>
+                        </div>
+                    </div>
+                    {% endif %}
+
                     <div class="card shadow-sm">
                         <div class="card-header bg-info text-white">API Endpoints</div>
                         <div class="card-body">
@@ -127,12 +176,21 @@
                                 </div>
                                 <small class="text-muted">Header: <code>x-api-key: &lt;key&gt;</code></small>
                             </div>
-                            <div>
+                            <div class="mb-3">
                                 <div class="form-label fw-semibold small mb-1">Embeddings</div>
                                 <div class="input-group input-group-sm">
                                     <span class="input-group-text bg-light text-muted">POST</span>
                                     <input type="text" class="form-control font-monospace text-muted"
                                            value="{{ base_url }}/v1/embeddings" readonly onclick="this.select();">
+                                </div>
+                                <small class="text-muted">Header: <code>Authorization: Bearer &lt;key&gt;</code></small>
+                            </div>
+                            <div>
+                                <div class="form-label fw-semibold small mb-1">Image generation</div>
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text bg-light text-muted">POST</span>
+                                    <input type="text" class="form-control font-monospace text-muted"
+                                           value="{{ base_url }}/v1/images/generations" readonly onclick="this.select();">
                                 </div>
                                 <small class="text-muted">Header: <code>Authorization: Bearer &lt;key&gt;</code></small>
                             </div>

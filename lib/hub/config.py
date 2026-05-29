@@ -10,7 +10,10 @@ their built-in defaults.
 """
 
 import json
+import logging
 import os
+
+logger = logging.getLogger("llmesh.hub.config")
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # `LLMESH_CONFIG_PATH` env var lets test harnesses (and operators) point the
@@ -56,10 +59,10 @@ def _reject_sample_keys(loaded: dict[str, str], source: str) -> None:
     if not leaked:
         return
     if os.environ.get(_ALLOW_SAMPLE_KEYS_ENV) == "1":
-        print(
-            f"WARNING: {_ALLOW_SAMPLE_KEYS_ENV}=1 — sample API key guard bypassed. "
-            f"Loaded publicly known key(s) {leaked} from {source}. "
-            f"This is a TEST-ONLY mode. Never set this in production."
+        logger.warning(
+            "%s=1 — sample API key guard bypassed. Loaded publicly known key(s) %s from %s. "
+            "This is a TEST-ONLY mode. Never set this in production.",
+            _ALLOW_SAMPLE_KEYS_ENV, leaked, source,
         )
         return
     raise RuntimeError(
@@ -90,6 +93,17 @@ def _load() -> None:
         _setdefault("SESSION_MEMORY_MODE",   session.get("memory_mode"))
         _setdefault("SESSION_COMPRESS_MODEL",session.get("compress_model"))
 
+        # Task persistence (D003 / D053). Falls back to SESSION_DB when unset.
+        task = cfg.get("task", {})
+        _setdefault("TASK_DB",               task.get("db"))
+        _setdefault("TASK_TTL_SECONDS",      task.get("ttl_seconds"))
+
+        # Routing scoring weights (D054). Penalise queue depth + CPU load
+        # so the highest-RAM node does not capture every request.
+        routing = cfg.get("routing", {})
+        _setdefault("ROUTING_QUEUE_PENALTY", routing.get("queue_penalty"))
+        _setdefault("ROUTING_CPU_PENALTY",   routing.get("cpu_penalty"))
+
         compress = cfg.get("compress", {})
         _setdefault("COMPRESS_MODEL_REPO",  compress.get("model_repo"))
         _setdefault("COMPRESS_MODEL_FILE",  compress.get("model_file"))
@@ -103,17 +117,17 @@ def _load() -> None:
         inference = cfg.get("inference", {})
         _setdefault("DEFAULT_CONTEXT_WINDOW",          inference.get("default_context_window"))
 
-        print(f"Loaded config from server_config.json ({len(api_keys)} API key(s)).")
+        logger.info("Loaded config from server_config.json (%d API key(s)).", len(api_keys))
 
     elif os.path.exists(_LEGACY_KEYS_PATH):
-        print("Warning: api_keys.json is deprecated. Rename to server_config.json (see docs/server_config.md).")
+        logger.warning("api_keys.json is deprecated. Rename to server_config.json (see docs/server_config.md).")
         with open(_LEGACY_KEYS_PATH, "r") as f:
             api_keys = json.load(f)
         _reject_sample_keys(api_keys, "api_keys.json")
-        print(f"Loaded {len(api_keys)} API key(s) from legacy api_keys.json.")
+        logger.info("Loaded %d API key(s) from legacy api_keys.json.", len(api_keys))
 
     else:
-        print(f"Warning: {_CONFIG_PATH} not found. Authentication will fail.")
+        logger.warning("%s not found. Authentication will fail.", _CONFIG_PATH)
 
 
 def _setdefault(key: str, value) -> None:

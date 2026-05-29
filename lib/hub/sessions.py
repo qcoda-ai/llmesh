@@ -1,7 +1,10 @@
 import os
 import json
+import logging
 import time
 import asyncio
+
+logger = logging.getLogger("llmesh.hub.sessions")
 
 SESSION_DB = os.getenv("SESSION_DB", "./sessions.db")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "7200"))
@@ -243,6 +246,6 @@ def get_session_store():
         import aiosqlite  # noqa: F401
         _session_store = SQLiteSessionStore(db_path)
     except ImportError:
-        print("Warning: aiosqlite not available, falling back to in-memory session store")
+        logger.warning("aiosqlite not available, falling back to in-memory session store")
         _session_store = MemorySessionStore()
     return _session_store

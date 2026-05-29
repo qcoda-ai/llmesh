@@ -19,9 +19,12 @@ will not be downloaded.
 
 import asyncio
 import json
+import logging
 import os
 import time
 from typing import NamedTuple
+
+logger = logging.getLogger("llmesh.hub.compressor")
 
 
 class SummarizeResult(NamedTuple):
@@ -60,12 +63,12 @@ def _download_and_load() -> None:
     except ImportError:
         raise RuntimeError("llama-cpp-python is required for in-process compression. pip install llama-cpp-python")
 
-    print(f"[compressor] Downloading {COMPRESS_MODEL_REPO}/{COMPRESS_MODEL_FILE} ...")
+    logger.info("Downloading %s/%s ...", COMPRESS_MODEL_REPO, COMPRESS_MODEL_FILE)
     model_path = hf_hub_download(
         repo_id=COMPRESS_MODEL_REPO,
         filename=COMPRESS_MODEL_FILE,
     )
-    print(f"[compressor] Loading model from {model_path} ...")
+    logger.info("Loading model from %s ...", model_path)
     _llm = Llama(
         model_path=model_path,
         n_ctx=COMPRESS_MODEL_CTX,
@@ -73,7 +76,7 @@ def _download_and_load() -> None:
         n_gpu_layers=0,   # CPU only — guarantees compatibility on all hardware
         verbose=False,
     )
-    print("[compressor] Compression model ready.")
+    logger.info("Compression model ready.")
 
 
 async def ensure_ready() -> bool:
@@ -87,7 +90,7 @@ async def ensure_ready() -> bool:
 
     mode = os.getenv("SESSION_MEMORY_MODE", "aggressive")
     if mode == "cutoff":
-        print("[compressor] SESSION_MEMORY_MODE=cutoff — skipping model download.")
+        logger.info("SESSION_MEMORY_MODE=cutoff — skipping model download.")
         return False
 
     loop = asyncio.get_event_loop()
@@ -96,7 +99,7 @@ async def ensure_ready() -> bool:
         _ready = True
         return True
     except Exception as exc:
-        print(f"[compressor] WARNING: Could not load compression model ({exc}). Falling back to cutoff mode.")
+        logger.warning("Could not load compression model (%s). Falling back to cutoff mode.", exc)
         return False
 
 
@@ -136,5 +139,5 @@ async def summarize(messages: list[dict]) -> SummarizeResult | None:
         try:
             return await loop.run_in_executor(None, _infer)
         except Exception as exc:
-            print(f"[compressor] Summarization failed: {exc}")
+            logger.error("Summarization failed: %s", exc)
             return None

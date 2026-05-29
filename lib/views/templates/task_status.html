@@ -91,6 +91,21 @@
                     </div>
                 </div>
 
+                {# D068: batcher telemetry — only shown when this was a streamed
+                   task (stream_batches > 0). Surfaces StreamBatcher convergence
+                   so operators can see batches & final_size without grepping
+                   agent logs. #}
+                {% if task.stream_batches %}
+                <div class="row text-muted mt-1 batcher-stats" id="batcherStats">
+                    <div class="col-6">
+                        <small>Stream batches: <span id="streamBatches">{{ task.stream_batches }}</span></small>
+                    </div>
+                    <div class="col-6 text-end">
+                        <small>Final batch size: <span id="streamFinalSize">{{ task.stream_final_size }}</span></small>
+                    </div>
+                </div>
+                {% endif %}
+
                 {% if task.messages %}
                 <hr>
                 <div class="mb-2">

@@ -5,7 +5,13 @@ left tasks._node_tasks[node_id] (an empty list) in place forever. Fix is
 storage.prune_inactive_nodes returns the stale ids and the cleanup loop
 calls tasks.drop_node_queue(...) AFTER recovery moves any pending/claimed
 tasks off the dead node.
+
+D053 made `queue_task_for_node` an async coroutine (SQLite write-through);
+tests `asyncio.run(...)` the call and pin TASK_DB to `:memory:` so the
+no-op MemoryTaskStore is used and nothing touches the filesystem.
 """
+import asyncio
+import os
 import time
 
 import pytest
@@ -21,7 +27,13 @@ def hub_and_node():
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    # D053: pin task store to in-memory no-op so queue_task_for_node's
+    # write-through call doesn't open a real SQLite file in $CWD.
+    monkeypatch.setenv("TASK_DB", ":memory:")
+    from lib.hub import task_store
+    monkeypatch.setattr(task_store, "_task_store", None)
+
     storage._nodes.clear()
     tasks._node_tasks.clear()
     tasks._task_index.clear()
@@ -29,6 +41,7 @@ def reset_state():
     storage._nodes.clear()
     tasks._node_tasks.clear()
     tasks._task_index.clear()
+    monkeypatch.setattr(task_store, "_task_store", None)
 
 
 def _register(node_id: str, last_seen: float):
@@ -49,7 +62,7 @@ def test_drop_node_queue_clears_residue():
     _register("dead", last_seen=time.time() - 1000)
     t = tasks.Task(task_id="x", kind=TaskKind.CHAT, model="m1", owner_id="o1")
     t.status = "completed"  # not eligible for recovery
-    tasks.queue_task_for_node("dead", t)
+    asyncio.run(tasks.queue_task_for_node("dead", t))
     assert "dead" in tasks._node_tasks
 
     stale = storage.prune_inactive_nodes(max_age_sec=1)
@@ -65,7 +78,7 @@ def test_prune_returns_stale_does_not_drop_yet():
     the caller's job AFTER recovery has had a chance to migrate tasks."""
     _register("dead", last_seen=time.time() - 1000)
     t = tasks.Task(task_id="x", kind=TaskKind.CHAT, model="m1", owner_id="o1")
-    tasks.queue_task_for_node("dead", t)
+    asyncio.run(tasks.queue_task_for_node("dead", t))
 
     stale = storage.prune_inactive_nodes(max_age_sec=1)
     assert stale == ["dead"]

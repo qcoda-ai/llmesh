@@ -410,7 +410,9 @@ async def test_streaming_attaches_vllm_bearer_when_set(monkeypatch):
 # --- 16. D015: num_ctx warning logged ---------------------------------------
 
 @pytest.mark.asyncio
-async def test_streaming_warns_when_num_ctx_set(patch_hosts, capsys):
+async def test_streaming_warns_when_num_ctx_set(patch_hosts, caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="llmesh.agent")
     sse = _sse([
         _delta(content="ok"),
         _delta(finish_reason="stop"),
@@ -423,9 +425,80 @@ async def test_streaming_warns_when_num_ctx_set(patch_hosts, capsys):
             c, _make_state(),
             {"task_id": "t10", "model": "m1", "messages": [], "num_ctx": 4096},
         )
-    captured = capsys.readouterr().out
-    assert "num_ctx=4096 ignored" in captured
-    assert "D015" in captured
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("num_ctx=4096 ignored" in m for m in messages), messages
+    assert any("D015" in m for m in messages), messages
+
+
+# --- 16b. D066: one-shot warning when vLLM stops emitting usage ------------
+
+@pytest.mark.asyncio
+async def test_vllm_no_usage_warning_fires_once_per_process(patch_hosts, caplog):
+    """D066: the 'vLLM did not emit usage chunk' warning should fire ONCE on
+    capability-state transition (None→False), not on every subsequent stream
+    against the same backend."""
+    import logging
+    caplog.set_level(logging.INFO, logger="llmesh.agent")
+
+    # Reset capability state so the test is order-independent.
+    agent_client._vllm_usage_chunk_supported = None
+
+    sse = _sse([
+        _delta(role="assistant"),
+        _delta(content="A"),
+        _delta(content="B"),
+        _delta(finish_reason="stop"),
+        # NO usage chunk — simulates older vLLM / stream_options stripped.
+    ])
+
+    for run in range(3):
+        rec = _PostRecorder()
+        transport = httpx.MockTransport(rec.handler(sse))
+        async with httpx.AsyncClient(transport=transport) as c:
+            await _run_streaming_vllm(
+                c, _make_state(),
+                {"task_id": f"t-d066-{run}", "model": "m1", "messages": []},
+            )
+
+    # Search captured log records for the D066 transition warning.
+    transitions = [
+        r for r in caplog.records
+        if "token accounting now uses delta-count estimation" in r.getMessage()
+    ]
+    assert len(transitions) == 1, (
+        f"Expected exactly 1 D066 transition warning across 3 streams, got "
+        f"{len(transitions)}: {[r.getMessage() for r in transitions]}"
+    )
+    # Capability state is sticky-False.
+    assert agent_client._vllm_usage_chunk_supported is False
+
+
+@pytest.mark.asyncio
+async def test_vllm_usage_recovery_logs_one_shot(patch_hosts, caplog):
+    """D066: recovery transition (False→True) when usage re-appears mid-session
+    also logs one-shot."""
+    import logging
+    caplog.set_level(logging.INFO, logger="llmesh.agent")
+
+    # Pre-set state to False (simulating earlier no-usage stream).
+    agent_client._vllm_usage_chunk_supported = False
+
+    sse = _sse([
+        _delta(content="ok"),
+        _delta(finish_reason="stop"),
+        _delta(usage={"prompt_tokens": 1, "completion_tokens": 1}),
+    ])
+    rec = _PostRecorder()
+    transport = httpx.MockTransport(rec.handler(sse))
+    async with httpx.AsyncClient(transport=transport) as c:
+        await _run_streaming_vllm(
+            c, _make_state(),
+            {"task_id": "t-d066-recover", "model": "m1", "messages": []},
+        )
+
+    recovers = [r for r in caplog.records if "capability restored (D066)" in r.getMessage()]
+    assert len(recovers) == 1, recovers
+    assert agent_client._vllm_usage_chunk_supported is True
 
 
 # --- 17. dispatcher: VLLM_STREAMING_ENABLED default (D044) ------------------

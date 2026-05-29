@@ -21,6 +21,7 @@
             {% endif %}
             
             <form action="/login" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <div class="mb-3">
                     <label for="api_key" class="form-label">API Key</label>
                     <input type="password" class="form-control" id="api_key" name="api_key" placeholder="Enter your organization API key" required>

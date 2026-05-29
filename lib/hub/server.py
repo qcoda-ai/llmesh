@@ -3,6 +3,7 @@ import time
 import uuid
 import os
 import secrets
+from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request, Form, Response, Cookie, Header, Depends
@@ -15,11 +16,14 @@ from . import config as _config  # noqa: F401 — must import first to populate 
 from .models import (
     RegistrationRequest, Node, HeartbeatRequest, RegistrationResponse,
     EmbeddingsRequest, TaskKind,
+    ImageGenerationRequest, ImageGenerationResponse,
 )
 import asyncio
 import json
 from . import storage
 from . import tasks
+from . import task_store
+from . import node_store
 from . import metrics
 from .metrics import upsert_node_registry, prune_old_metrics
 from .sessions import get_session_store, SESSION_MAX_TURNS, SESSION_MEMORY_MODE
@@ -47,10 +51,38 @@ def _resolve_session(token: str | None) -> str | None:
         return None
     return _session_tokens.get(token)
 
+
+# ---------------------------------------------------------------------------
+# CSRF (D055) — double-submit cookie pattern
+# ---------------------------------------------------------------------------
+# Browser-driven POST forms (`/login`, `/dashboard/request_inference`) require
+# a per-form synchronizer token that matches an httponly cookie set on the
+# preceding GET. Defense-in-depth alongside the existing `samesite="Strict"`
+# session cookie. Bearer-token API endpoints (`/v1/*`, `/register`, etc) do
+# not need CSRF — they do not authenticate via cookies and are not reachable
+# from a cross-origin HTML form with valid credentials.
+CSRF_COOKIE_NAME = "llmesh_csrf"
+
+
+def _require_csrf(form_token: str | None, cookie_token: str | None) -> None:
+    """Reject the request if the submitted form token does not match the
+    cookie token. Timing-safe compare. Called at the top of every POST
+    handler that processes a browser form."""
+    if (
+        not form_token
+        or not cookie_token
+        or not secrets.compare_digest(form_token, cookie_token)
+    ):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 RATE_LIMIT_INFERENCE = os.getenv("RATE_LIMIT_INFERENCE", "60/minute")
+# D064: image-gen caps. Hub-side validation before routing.
+MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "4"))
+MAX_IMAGE_PROMPT_BYTES = int(os.getenv("MAX_IMAGE_PROMPT_BYTES", "8192"))  # ~2k tokens
+IMAGE_TASK_TIMEOUT_S = float(os.getenv("IMAGE_TASK_TIMEOUT_S", "300.0"))
 RATE_LIMIT_LIST      = os.getenv("RATE_LIMIT_LIST",      "120/minute")
 RATE_LIMIT_REGISTER  = os.getenv("RATE_LIMIT_REGISTER",  "20/minute")
 RATE_LIMIT_LOGIN     = os.getenv("RATE_LIMIT_LOGIN",     "10/minute")
@@ -59,8 +91,12 @@ RATE_LIMIT_HEARTBEAT = os.getenv("RATE_LIMIT_HEARTBEAT", "30/minute")
 # Per-owner TTL cache for GET /v1/models. The endpoint scans the node registry
 # on every call; under rapid back-to-back client traffic (e.g. qc_eval harness)
 # this keeps it off the hot path. Set MODELS_CACHE_TTL=0 to disable. See D027.
+# D056: bounded LRU. Without a cap the dict grows one entry per owner_id ever
+# queried; a long-running hub with many owners would leak the entries
+# indefinitely. Mirror the `_dashboard_cache` pattern from metrics.py.
 MODELS_CACHE_TTL = float(os.getenv("MODELS_CACHE_TTL", "10.0"))
-_models_cache: dict[str, tuple[float, dict]] = {}
+MODELS_CACHE_MAX = int(os.getenv("MODELS_CACHE_MAX", "64"))
+_models_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
 
 # Payload bounds (D032; default raised to 256 KB by D049). Reject oversize
 # requests at the hub edge so a single pathological client cannot exhaust the
@@ -181,6 +217,15 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 app.add_exception_handler(PayloadTooLarge, _payload_too_large_handler)
 
 STREAM_CHUNK_TIMEOUT = float(os.getenv("STREAM_CHUNK_TIMEOUT", "300.0"))
+
+# Routing scoring weights (D054 closes D036 §1). The legacy pure-RAM sort
+# overloaded the highest-RAM node even while lower-RAM peers sat idle.
+# Score = ram_gb - queue_depth * QUEUE_PENALTY - cpu_load * CPU_PENALTY.
+# Defaults sized so one queued task costs ~one tier of RAM (8 GB) and a
+# fully saturated CPU costs ~10 GB. Both env-tunable.
+ROUTING_QUEUE_PENALTY = float(os.getenv("ROUTING_QUEUE_PENALTY", "8.0"))
+ROUTING_CPU_PENALTY   = float(os.getenv("ROUTING_CPU_PENALTY",   "0.1"))
+
 DEFAULT_CONTEXT_WINDOW = os.getenv("DEFAULT_CONTEXT_WINDOW")
 if DEFAULT_CONTEXT_WINDOW:
     DEFAULT_CONTEXT_WINDOW = int(DEFAULT_CONTEXT_WINDOW)
@@ -193,6 +238,10 @@ class StreamChunk(BaseModel):
     done: bool = False
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # D068: batcher telemetry, populated only on the done frame. Defaults
+    # preserve back-compat with agents that haven't been upgraded yet.
+    stream_batches: int = 0       # total /stream POSTs this task issued
+    stream_final_size: int = 0    # batcher's final per-flush size at end of stream
 
 
 def _is_error_result(result: dict) -> bool:
@@ -218,11 +267,23 @@ def _node_has_embedding_model(n, model: str) -> bool:
     return model in getattr(n.resources, "embedding_models", [])
 
 
+def _node_has_image_model(n, model: str) -> bool:
+    """D064: image routing is gated on `image_models` only AND the node must
+    advertise `image_available=True`. VRAM filtering is layered on top in
+    `_select_image_node` because the registry-side `min_vram_gb` for the model
+    is consulted at routing time, not membership time."""
+    return (
+        getattr(n.resources, "image_available", False)
+        and model in getattr(n.resources, "image_models", [])
+    )
+
+
 def _node_is_capable(n) -> bool:
     return (
         n.resources.ollama_available or
         getattr(n.resources, "vllm_available", False) or
-        getattr(n.resources, "mlx_available", False)
+        getattr(n.resources, "mlx_available", False) or
+        getattr(n.resources, "image_available", False)
     )
 
 
@@ -287,7 +348,27 @@ def _capability_predicate_for_kind(kind: tasks.TaskKind):
     return _node_has_model
 
 
-def _try_requeue(task: tasks.Task) -> bool:
+def _score_node(node) -> float:
+    """Weighted routing score (D054, closes D036 §1).
+
+    Higher is better. Penalises queue depth heavily and CPU load gently so
+    the highest-RAM node does not capture every request while peers sit
+    idle. Computed from in-memory state only — no DB read, no heartbeat
+    round-trip. Tunable via ROUTING_QUEUE_PENALTY / ROUTING_CPU_PENALTY.
+    """
+    queue_depth = sum(
+        1 for t in tasks.get_tasks_for_node(node.node_id)
+        if t.status in ("pending", "claimed")
+    )
+    cpu_load = getattr(node, "cpu_load", 0.0) or 0.0
+    return (
+        node.resources.ram_gb
+        - queue_depth * ROUTING_QUEUE_PENALTY
+        - cpu_load    * ROUTING_CPU_PENALTY
+    )
+
+
+async def _try_requeue(task: tasks.Task) -> bool:
     """Find a capable node not yet attempted and requeue the task. Returns True on success."""
     all_nodes = storage.get_all_nodes()
     current_time = time.time()
@@ -302,15 +383,15 @@ def _try_requeue(task: tasks.Task) -> bool:
     ]
     if not candidates:
         return False
-    candidates.sort(key=lambda n: n.resources.ram_gb, reverse=True)
+    candidates.sort(key=_score_node, reverse=True)
     selected = candidates[0]
     task.attempted_nodes.add(selected.node_id)
-    tasks.requeue_task(task, selected.node_id)
+    await tasks.requeue_task(task, selected.node_id)
     logger.info("Requeued task %s → node %s (retries_left=%s)", task.task_id, selected.node_id, task.retries_left)
     return True
 
 
-def _recover_tasks_from_dead_node(dead_node_id: str) -> None:
+async def _recover_tasks_from_dead_node(dead_node_id: str) -> None:
     """Re-queue or fail any pending/claimed tasks stranded on a pruned node."""
     for task in tasks.get_tasks_for_node(dead_node_id):
         if task.status not in ("pending", "claimed"):
@@ -318,10 +399,10 @@ def _recover_tasks_from_dead_node(dead_node_id: str) -> None:
         task.attempted_nodes.add(dead_node_id)
         if task.retries_left > 0:
             task.retries_left -= 1
-            if _try_requeue(task):
+            if await _try_requeue(task):
                 logger.info("Recovered task %s from dead node %s", task.task_id, dead_node_id)
                 continue
-        tasks.fail_task(task.task_id, f"Node {dead_node_id} went offline and no alternate node is available")
+        await tasks.fail_task(task.task_id, f"Node {dead_node_id} went offline and no alternate node is available")
         logger.warning("Failed task %s: no capable node after %s went offline", task.task_id, dead_node_id)
 
 
@@ -334,6 +415,30 @@ async def startup():
     # Start the single module-level metrics flush task (D022).
     await metrics.start_background()
 
+    # Node-registry durability recovery (D026 / D058). Must run BEFORE task
+    # recovery so the rehydrated `_node_tasks` mapping references nodes that
+    # actually exist in `_nodes`. Rows with last_seen >90s are pruned in-place
+    # at load time so a hub restart after a long downtime does not surface
+    # dead nodes. Restored nodes carry hash-only credentials; verify falls
+    # back to hash compare until the agent re-registers with fresh plaintext.
+    try:
+        nodes_restored = await storage.load_persisted_nodes(max_age_sec=90.0)
+        if nodes_restored:
+            logger.info("Node registry restored: %d node(s) carried over from prior process", nodes_restored)
+    except Exception as exc:
+        logger.warning("Node registry recovery failed: %s — continuing with empty registry", exc)
+
+    # Task durability recovery (D003 / D053). Rebuilds the in-memory task
+    # index from rows persisted by the previous hub process. Claimed rows
+    # reset to pending so the next eligible node picks them up; mid-flight
+    # streaming sessions remain unrecoverable (D003 §Constraints).
+    try:
+        restored, reset = await tasks.load_persisted()
+        if restored or reset:
+            logger.info("Task store restored: %d pending, %d claimed-reset-to-pending", restored, reset)
+    except Exception as exc:
+        logger.warning("Task store recovery failed: %s — continuing with empty queue", exc)
+
     async def cleanup_loop():
         while True:
             await asyncio.sleep(30)
@@ -341,7 +446,7 @@ async def startup():
             if pruned:
                 logger.info("Pruned %d inactive node(s): %s", len(pruned), pruned)
                 for dead_node_id in pruned:
-                    _recover_tasks_from_dead_node(dead_node_id)
+                    await _recover_tasks_from_dead_node(dead_node_id)
                     # D035: drop the per-node queue residue AFTER recovery so
                     # any pending/claimed tasks were given a chance to migrate.
                     tasks.drop_node_queue(dead_node_id)
@@ -354,7 +459,7 @@ async def startup():
             if deleted_e or deleted_s:
                 logger.info("Pruned metrics: %d inference events, %d node snapshots", deleted_e, deleted_s)
 
-            pruned_tasks = tasks.prune_old_tasks(tasks.TASK_TTL_SECONDS)
+            pruned_tasks = await tasks.prune_old_tasks(tasks.TASK_TTL_SECONDS)
             if pruned_tasks:
                 logger.info("Pruned %d completed/failed task(s) older than %ss", pruned_tasks, tasks.TASK_TTL_SECONDS)
 
@@ -423,6 +528,158 @@ async def _compress_session(session_id: str, owner_id: str, messages: list[dict]
 
 def _sse_frame(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
+
+
+def _sse_event(event_name: str, data: dict) -> str:
+    """Render a named SSE event (Anthropic-style) — `event:` + `data:` lines.
+
+    Per Anthropic Messages streaming spec (D061): each event has both a named
+    `event:` line and a JSON `data:` payload. OpenAI streams use `_sse_frame`
+    (data-only). Anthropic SDKs read the event name to dispatch on type.
+    """
+    return f"event: {event_name}\ndata: {json.dumps(data)}\n\n"
+
+
+def _estimate_input_tokens(messages: list) -> int:
+    """Char-divide estimate of input tokens for Anthropic message_start usage.
+
+    Anthropic emits `message_start.message.usage.input_tokens` BEFORE any
+    generation. The hub does not yet have the agent-reported `prompt_tokens`
+    at that point (the agent hasn't claimed the task yet). Estimate via
+    `max(1, total_chars // 4)` — a long-standing rough heuristic for English
+    text against tokenizer behavior. The cumulative `output_tokens` in
+    `message_delta.usage` carries the agent-reported real number at end of
+    stream. Clients that need precise input accounting should use the
+    non-streaming `/v1/messages` response which carries exact `usage`.
+    """
+    total = 0
+    for m in messages or []:
+        c = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for block in c:
+                t = block.get("text") if isinstance(block, dict) else getattr(block, "text", "")
+                if isinstance(t, str):
+                    total += len(t)
+    return max(1, total // 4)
+
+
+async def _real_sse_generator_anthropic(
+    task: tasks.Task,
+    request: Request,
+    message_id: str,
+    model: str,
+    input_tokens_estimate: int,
+):
+    """Async generator that drains a task's stream_queue and yields Anthropic
+    Messages SSE events (D061).
+
+    Event sequence per https://platform.claude.com/docs/en/api/messages-streaming
+    (verified 2026-05-28):
+
+        event: message_start          → message envelope w/ usage.input_tokens
+        event: content_block_start    → index 0, type:"text", text:""
+        event: content_block_delta×N  → delta.type:"text_delta", delta.text:"..."
+        event: content_block_stop     → index 0
+        event: message_delta          → delta.stop_reason:"end_turn",
+                                        usage.output_tokens:N (cumulative)
+        event: message_stop
+
+    Errors emit `event: error` with `{"type":"error","error":{"type":...,"message":...}}`
+    per spec. Per-event `ping` keepalives are valid per spec but omitted here
+    (the hub already pushes deltas at a high enough rate that long quiet
+    gaps are not expected; STREAM_CHUNK_TIMEOUT bounds the upper end).
+
+    Reuses task.stream_queue + STREAM_CHUNK_TIMEOUT semantics from the
+    OpenAI generator so cancellation, timeout, and node-disconnect paths
+    stay structurally identical.
+    """
+    # 1. message_start — emits the message envelope with input_tokens estimate.
+    #    output_tokens starts at 0; the cumulative count lands in message_delta.
+    yield _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": input_tokens_estimate,
+                "output_tokens": 0,
+            },
+        },
+    })
+
+    # 2. content_block_start at index 0 — text block.
+    yield _sse_event("content_block_start", {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    })
+
+    accumulated: list[str] = []
+    aborted = False
+    error_payload: dict | None = None
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(task.stream_queue.get(), timeout=STREAM_CHUNK_TIMEOUT)
+            except asyncio.TimeoutError:
+                task.stream_cancelled = True
+                logger.warning(
+                    "[SSE-anthropic] Task %s aborted: stream timeout (no chunk from node for %ss)",
+                    task.task_id, STREAM_CHUNK_TIMEOUT,
+                )
+                error_payload = {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Stream timeout — node may be offline",
+                    },
+                }
+                aborted = True
+                break
+
+            if chunk is None:  # sentinel — streaming complete
+                break
+
+            accumulated.append(chunk)
+            yield _sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": chunk},
+            })
+    except asyncio.CancelledError:
+        task.stream_cancelled = True
+        logger.warning("[SSE-anthropic] Task %s aborted: consumer disconnected", task.task_id)
+        raise
+
+    if aborted and error_payload is not None:
+        yield _sse_event("error", error_payload)
+        return
+
+    # 3. content_block_stop — close the text block.
+    yield _sse_event("content_block_stop", {
+        "type": "content_block_stop",
+        "index": 0,
+    })
+
+    # 4. message_delta — top-level stop_reason + cumulative output_tokens.
+    #    Per docs Warning callout: "The token counts shown in the `usage` field
+    #    of the `message_delta` event are *cumulative*."
+    output_tokens = task.completion_tokens or 0
+    yield _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+
+    # 5. message_stop — terminator.
+    yield _sse_event("message_stop", {"type": "message_stop"})
 
 
 async def _real_sse_generator(
@@ -523,13 +780,21 @@ async def register_node(request: Request, reg: RegistrationRequest):
 
     node_id = reg.node_fingerprint if reg.node_fingerprint else str(uuid.uuid4())
     existing = storage.get_node(node_id)
+    # Re-registration of an existing node: keep the same plaintext token if
+    # the previous process is still holding it; otherwise issue fresh
+    # plaintext. Hash always recomputed so the persistence layer stays in
+    # sync. See D004 (token preservation across re-register) + D058 (hash
+    # persistence).
     node_token = existing.node_token if (existing and existing.node_token) else secrets.token_hex(32)
+    node_token_hash = storage._hash_token(node_token)
     node = Node(
         node_id=node_id,
         owner_id=owner_id,
         resources=reg.resources,
         last_seen=time.time(),
         node_token=node_token,
+        node_token_hash=node_token_hash,
+        fingerprint=reg.node_fingerprint or node_id,
     )
 
     storage.store_node(node)
@@ -555,6 +820,11 @@ async def heartbeat(request: Request, node_id: str, req: HeartbeatRequest, _: No
     node.resources.ollama_available = req.ollama_available
     node.resources.vllm_available = req.vllm_available
     node.resources.mlx_available = req.mlx_available
+    # D064: image_available toggles per heartbeat (mflux import + model dir
+    # state may change between heartbeats — operator installing/removing
+    # models). image_models / vram_gb stay sticky from registration; full
+    # re-advertise happens on re-register.
+    node.resources.image_available = getattr(req, "image_available", False)
     setattr(node, "cpu_load", req.cpu_load)
     setattr(node, "latency_ms", req.latency_ms)
     storage.store_node(node)
@@ -573,8 +843,9 @@ async def list_nodes(request: Request, authorization: str | None = Header(None))
 
 def _select_node(owner_id: str, model: str, has_model_predicate) -> "Node | None":
     """Find the best currently-online node for an owner+model pair, using the
-    given capability predicate. Sorted by RAM desc — D036 spec covers a
-    weighted score replacement that is intentionally deferred from this PR."""
+    given capability predicate. Sorted by `_score_node` desc — weighted by
+    queue depth and CPU load so the highest-RAM node does not capture every
+    request while peers sit idle (D054 closes D036 §1)."""
     all_nodes = storage.get_all_nodes()
     current_time = time.time()
     capable = [
@@ -586,11 +857,11 @@ def _select_node(owner_id: str, model: str, has_model_predicate) -> "Node | None
     ]
     if not capable:
         return None
-    capable.sort(key=lambda n: n.resources.ram_gb, reverse=True)
+    capable.sort(key=_score_node, reverse=True)
     return capable[0]
 
 
-def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskResponse:
+async def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskResponse:
     """Internal routing — owner_id must already be validated before calling."""
     selected_node = _select_node(req.owner_id, req.model, _node_has_model)
     if selected_node is None:
@@ -625,14 +896,106 @@ def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskRespons
         task.stream = True
         task.stream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
 
-    tasks.queue_task_for_node(selected_node.node_id, task)
+    await tasks.queue_task_for_node(selected_node.node_id, task)
 
     logger.info("Routed task %s to node %s using model %s stream=%s", task_id, selected_node.node_id, req.model, task.stream)
 
     return TaskResponse(task_id=task_id, node_assigned=selected_node.node_id)
 
 
-def _route_embedding(req: EmbeddingsRequest, owner_id: str, inputs: list[str]) -> TaskResponse:
+async def _select_image_node(owner_id: str, model: str) -> "Node | None":
+    """D064 image routing — capability + min_vram filter, then D054 score.
+
+    Layered on top of `_select_node` because the VRAM check pulls from the
+    hub-side image registry (`min_vram_gb`) which the generic predicate path
+    doesn't have. Returns None if no node qualifies (caller emits 503)."""
+    from . import image_registry as _img_reg
+    reg_entry = _img_reg.get(model)
+    min_vram = reg_entry.min_vram_gb if reg_entry else 0
+
+    all_nodes = storage.get_all_nodes()
+    current_time = time.time()
+    capable = [
+        n for n in all_nodes
+        if n.owner_id == owner_id
+        and _node_is_capable(n)
+        and (current_time - n.last_seen < 30)
+        and _node_has_image_model(n, model)
+        and getattr(n.resources, "vram_gb", 0.0) >= min_vram
+    ]
+    if not capable:
+        return None
+    capable.sort(key=_score_node, reverse=True)
+    return capable[0]
+
+
+async def _route_image(req, owner_id: str) -> TaskResponse:
+    """D064: select an image-capable node + min_vram and queue an image task."""
+    from . import image_registry as _img_reg
+
+    reg_entry = _img_reg.get(req.model)
+    if reg_entry is None:
+        # Unknown model id — let routing also try in case operator advertised
+        # an `unverified: true` model. Fall through to capability lookup.
+        pass
+
+    selected_node = await _select_image_node(owner_id, req.model)
+    if selected_node is None:
+        # 404 per D064 §"No model fallback / substitution" — return the list
+        # of models the owner CAN reach so client can present an actionable
+        # choice. Same shape as embeddings 503 but structured.
+        all_for_owner = [
+            n for n in storage.get_all_nodes()
+            if n.owner_id == owner_id and getattr(n.resources, "image_available", False)
+        ]
+        available_models = sorted({m for n in all_for_owner for m in getattr(n.resources, "image_models", [])})
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "type": "model_not_available",
+                    "model": req.model,
+                    "available": available_models,
+                    "message": (
+                        f"No nodes online with image model {req.model!r}. "
+                        f"Install with `llmesh-agent install-image-model {req.model}` on an Apple Silicon node "
+                        f"and ensure the node has sufficient VRAM."
+                    ),
+                }
+            },
+        )
+
+    # Map operator-facing size token → concrete WxH per model family.
+    concrete_size = _img_reg.resolve_size(req.model, req.size)
+    steps = _img_reg.quality_to_steps(req.quality)
+
+    task_id = str(uuid.uuid4())
+    task = tasks.Task(
+        task_id=task_id,
+        kind=tasks.TaskKind.IMAGE,
+        payload={
+            "prompt": req.prompt,
+            "negative_prompt": req.negative_prompt,
+            "size": concrete_size,
+            "n": req.n,
+            "seed": req.seed,
+            "quality": req.quality,
+            "steps": steps,
+        },
+        model=req.model,
+        owner_id=owner_id,
+    )
+    task.attempted_nodes.add(selected_node.node_id)
+    await tasks.queue_task_for_node(selected_node.node_id, task)
+
+    logger.info(
+        "Routed image task %s to node %s model=%s size=%s n=%s quality=%s",
+        task_id, selected_node.node_id, req.model, concrete_size, req.n, req.quality,
+    )
+    return TaskResponse(task_id=task_id, node_assigned=selected_node.node_id)
+
+
+async def _route_embedding(req: EmbeddingsRequest, owner_id: str, inputs: list[str]) -> TaskResponse:
     """D028 routing: select an embedding-capable node and queue an embedding
     task. Inputs must already be normalized (str → [str]) and bounds-checked."""
     selected_node = _select_node(owner_id, req.model, _node_has_embedding_model)
@@ -654,7 +1017,7 @@ def _route_embedding(req: EmbeddingsRequest, owner_id: str, inputs: list[str]) -
         owner_id=owner_id,
     )
     task.attempted_nodes.add(selected_node.node_id)
-    tasks.queue_task_for_node(selected_node.node_id, task)
+    await tasks.queue_task_for_node(selected_node.node_id, task)
 
     logger.info("Routed embedding task %s to node %s using model %s batch=%d",
                 task_id, selected_node.node_id, req.model, len(inputs))
@@ -671,13 +1034,13 @@ async def request_inference(request: Request, req: InferenceRequest, authorizati
     if not owner_id:
         raise HTTPException(status_code=403, detail="Invalid API key")
     req.owner_id = owner_id  # override any client-supplied value
-    return _route_inference(req)
+    return await _route_inference(req)
 
 
 @app.get("/tasks/{node_id}/pending")
 @limiter.limit(RATE_LIMIT_HEARTBEAT)
 async def get_pending_tasks_for_node(request: Request, node_id: str, _: None = Depends(_require_node_token)):
-    pending = tasks.get_pending_tasks(node_id)
+    pending = await tasks.get_pending_tasks(node_id)
     out = []
     for t in pending:
         # Legacy fields (prompt/messages/num_ctx) are kept for chat tasks so
@@ -742,9 +1105,20 @@ async def stream_task_chunk(
             _put_or_drop_oldest(body.chunk)
         task.prompt_tokens = body.prompt_tokens
         task.completion_tokens = body.completion_tokens
+        # D068: stash batcher telemetry on the task. Surfaced in metrics +
+        # dashboard task viewer. Zero from older agents that don't send it.
+        task.stream_batches = body.stream_batches
+        task.stream_final_size = body.stream_final_size
         task.status = "completed"
         _put_or_drop_oldest(None)  # sentinel — SSE generator closes on None
         task.done_event.set()
+        # Persist terminal status + token accounting for the streaming path
+        # (D053). result_json stays NULL — streamed tokens are not reassembled
+        # server-side; SSE consumers received them in real time. Best-effort:
+        # store failures log + continue, never roll back in-memory state.
+        await task_store.get_task_store().save_result(
+            task_id, None, body.prompt_tokens, body.completion_tokens, status="completed",
+        )
     else:
         _put_or_drop_oldest(body.chunk)
 
@@ -776,7 +1150,7 @@ async def submit_task_result(request: Request, node_id: str, task_id: str, resul
     else:
         result_value = result.get("output", "")
 
-    task = tasks.record_task_result(
+    task = await tasks.record_task_result(
         task_id,
         result_value,
         prompt_tokens=result.get("prompt_tokens", 0),
@@ -791,7 +1165,7 @@ async def submit_task_result(request: Request, node_id: str, task_id: str, resul
     if is_error and task.retries_left > 0:
         task.retries_left -= 1
         task.attempted_nodes.add(node_id)
-        if _try_requeue(task):
+        if await _try_requeue(task):
             _emit_inference_event(task, node_id, duration_ms, result, status="fail")
             return {"status": "requeued"}
         # No alternate node — fall through to terminal failure
@@ -799,12 +1173,14 @@ async def submit_task_result(request: Request, node_id: str, task_id: str, resul
     if is_error:
         # On error the agent reports a string under `output`; keep that for the
         # human-readable failure message regardless of kind.
-        tasks.fail_task(task.task_id, result.get("output") or "task failed")
+        await tasks.fail_task(task.task_id, result.get("output") or "task failed")
         _emit_inference_event(task, node_id, duration_ms, result, status="fail")
         _bridge_blocking_completion_to_stream_consumer(task, error=True)
     else:
         task.status = "completed"
         task.done_event.set()
+        # Persist terminal status (record_task_result already saved result+tokens).
+        await task_store.get_task_store().mark_status(task.task_id, "completed")
         _bridge_blocking_completion_to_stream_consumer(task, error=False)
         _emit_inference_event(task, node_id, duration_ms, result, status="success")
 
@@ -850,6 +1226,10 @@ def _emit_inference_event(task: tasks.Task, node_id: str, duration_ms: float,
         tokens_prompt=result.get("prompt_tokens", 0),
         tokens_completion=result.get("completion_tokens", 0),
         kind=task.kind.value,
+        # D068: batcher telemetry passes through from the streaming done frame.
+        # Zero on non-streamed tasks; populated on streamed ones.
+        stream_batches=getattr(task, "stream_batches", 0),
+        stream_final_size=getattr(task, "stream_final_size", 0),
     )
 
 
@@ -1009,6 +1389,7 @@ async def list_models(request: Request, authorization: str | None = Header(None)
     if MODELS_CACHE_TTL > 0:
         cached = _models_cache.get(owner_id)
         if cached and cached[0] > now_mono:
+            _models_cache.move_to_end(owner_id)
             return cached[1]
 
     all_nodes = storage.get_all_nodes()
@@ -1059,6 +1440,9 @@ async def list_models(request: Request, authorization: str | None = Header(None)
     response = {"object": "list", "data": model_list}
     if MODELS_CACHE_TTL > 0:
         _models_cache[owner_id] = (now_mono + MODELS_CACHE_TTL, response)
+        _models_cache.move_to_end(owner_id)
+        while len(_models_cache) > MODELS_CACHE_MAX:
+            _models_cache.popitem(last=False)
     return response
 
 
@@ -1148,7 +1532,7 @@ async def _process_chat_completion(
     )
 
     try:
-        task_response = _route_inference(inf_req, stream=want_stream)
+        task_response = await _route_inference(inf_req, stream=want_stream)
         node_id = task_response.node_assigned
         task_id = task_response.task_id
     except HTTPException as e:
@@ -1279,24 +1663,71 @@ async def anthropic_messages(
     if not x_api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing x-api-key header")
 
-    if req.stream:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": "Streaming is not supported on /v1/messages. Use /v1/chat/completions with stream=true.",
-                    "type": "invalid_request_error",
-                }
-            },
-        )
-
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     task, err_resp, session_id, _owner_id, _stored_history, _incoming = await _process_chat_completion(
         req.model, messages, x_api_key, x_session_id,
-        num_ctx=req.num_ctx, max_tokens=req.max_tokens,
+        want_stream=req.stream, num_ctx=req.num_ctx, max_tokens=req.max_tokens,
     )
     if err_resp:
         return err_resp
+
+    # Anthropic streaming branch (D061). Reuses the OpenAI streaming pipeline
+    # (task.stream_queue or fake-SSE fallback) but emits anthropic named events
+    # instead of the OpenAI chat.completion.chunk shape.
+    if req.stream:
+        message_id = f"msg_{task.task_id}"
+        sse_headers = {
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Session-ID": session_id,
+            "X-Retry-Count": str(task.initial_retries - task.retries_left),
+        }
+        input_estimate = _estimate_input_tokens(messages)
+        if task.stream_queue is not None:
+            return StreamingResponse(
+                _real_sse_generator_anthropic(task, request, message_id, req.model, input_estimate),
+                media_type="text/event-stream",
+                headers=sse_headers,
+            )
+
+        # Fallback: non-streaming-capable node — wait for completion then
+        # emit the full text as a single content_block_delta. Preserves the
+        # event-sequence contract so SDK accumulators still parse cleanly.
+        try:
+            await asyncio.wait_for(task.done_event.wait(), timeout=600.0)
+        except asyncio.TimeoutError:
+            return JSONResponse(status_code=504, content={"error": {"message": "LLMesh task timed out", "type": "timeout"}})
+        if task.status != "completed":
+            return JSONResponse(status_code=500, content={"error": {"message": task.result, "type": "server_error"}})
+
+        async def _fake_anthropic_sse():
+            yield _sse_event("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": message_id, "type": "message", "role": "assistant",
+                    "content": [], "model": req.model,
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": input_estimate, "output_tokens": 0},
+                },
+            })
+            yield _sse_event("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            yield _sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": task.result or ""},
+            })
+            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            yield _sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": task.completion_tokens or 0},
+            })
+            yield _sse_event("message_stop", {"type": "message_stop"})
+
+        return StreamingResponse(_fake_anthropic_sse(), media_type="text/event-stream", headers=sse_headers)
 
     response.headers["X-Session-ID"] = session_id
     response.headers["X-Retry-Count"] = str(task.initial_retries - task.retries_left)
@@ -1346,7 +1777,7 @@ async def embeddings(
     inputs = [req.input] if isinstance(req.input, str) else list(req.input)
     _validate_embeddings_payload(inputs)
 
-    task_response = _route_embedding(req, owner_id, inputs)
+    task_response = await _route_embedding(req, owner_id, inputs)
     queued_task = tasks.get_task_status(task_response.node_assigned, task_response.task_id)
     if queued_task is None:
         raise HTTPException(status_code=500, detail="Task not found after queuing")
@@ -1381,6 +1812,91 @@ async def embeddings(
     }
 
 
+@app.post("/v1/images/generations", response_model=ImageGenerationResponse)
+@limiter.limit(RATE_LIMIT_INFERENCE)
+async def images_generations(
+    request: Request,
+    req: ImageGenerationRequest,
+    response: Response,
+    authorization: str | None = Header(None),
+):
+    """OpenAI-compatible image generation endpoint (D064).
+
+    Routes to an `image`-capable node with sufficient VRAM for the requested
+    model (per hub-side `image_registry.min_vram_gb`). Stateless — no session
+    storage. Returns OpenAI-shaped `{"created":N, "data":[{"b64_json":"..."}, ...]}`.
+
+    Limitations (v1 — see D064):
+      * `response_format` must be `"b64_json"` (URL mode deferred to v2).
+      * Backend is mflux on Apple Silicon only.
+      * No model substitution: missing model → 404 with structured error.
+      * No content filter; operator policy per docs/image_gen.md.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Authorization header")
+    api_key = authorization.replace("Bearer ", "")
+    owner_id = storage.authenticate_owner(api_key)
+    if not owner_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+
+    # Bounds validation before consuming a node slot (D049 pattern).
+    if req.n < 1 or req.n > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "type": "invalid_request_error",
+                    "param": "n",
+                    "message": f"`n` must be between 1 and {MAX_IMAGES_PER_REQUEST} (got {req.n})",
+                }
+            },
+        )
+    prompt_bytes = len((req.prompt or "").encode("utf-8"))
+    if prompt_bytes > MAX_IMAGE_PROMPT_BYTES:
+        raise _payload_too_large(field="prompt", limit=MAX_IMAGE_PROMPT_BYTES, actual=prompt_bytes)
+
+    task_response = await _route_image(req, owner_id)
+    queued_task = tasks.get_task_status(task_response.node_assigned, task_response.task_id)
+    if queued_task is None:
+        raise HTTPException(status_code=500, detail="Task not found after queuing")
+
+    try:
+        await asyncio.wait_for(queued_task.done_event.wait(), timeout=IMAGE_TASK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail={
+            "error": {"type": "timeout", "message": f"Image generation timed out after {IMAGE_TASK_TIMEOUT_S:.0f}s"}
+        })
+
+    if queued_task.status != "completed":
+        raise HTTPException(status_code=502, detail={
+            "error": {"type": "backend_error", "message": str(queued_task.result)}
+        })
+
+    # `task.result` is a list[str] of base64 PNGs from the agent driver.
+    images: list[str] = queued_task.result or []
+    if not isinstance(images, list):
+        raise HTTPException(status_code=500, detail="Image task returned non-list result")
+
+    # D064 metrics hook (image_event). Tokens are zero on this path; counts +
+    # wall-time + resolution + steps are the units that matter.
+    metrics.log_image_event(
+        owner_id=owner_id,
+        node_id=task_response.node_assigned,
+        model=req.model,
+        status="success",
+        duration_ms=int((time.time() - queued_task.start_time) * 1000),
+        image_count=len(images),
+        size=queued_task.payload.get("size", ""),
+        steps=int(queued_task.payload.get("steps", 0) or 0),
+        quality_tier=queued_task.payload.get("quality", "draft"),
+    )
+
+    return {
+        "created": int(time.time()),
+        "data": [{"b64_json": b} for b in images],
+    }
+
+
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str, authorization: str | None = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -1401,14 +1917,34 @@ async def root_redirect():
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_view(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    existing = request.cookies.get(CSRF_COOKIE_NAME)
+    csrf = existing or secrets.token_urlsafe(32)
+    response = templates.TemplateResponse(
+        "login.html", {"request": request, "error": None, "csrf_token": csrf}
+    )
+    if not existing:
+        response.set_cookie(
+            key=CSRF_COOKIE_NAME, value=csrf,
+            httponly=True, secure=True, samesite="Strict",
+        )
+    return response
 
 @app.post("/login", response_class=HTMLResponse)
 @limiter.limit(RATE_LIMIT_LOGIN)
-async def login_submit(request: Request, api_key: str = Form(...)):
+async def login_submit(
+    request: Request,
+    api_key: str = Form(...),
+    csrf_token: str = Form(...),
+    llmesh_csrf: str | None = Cookie(None),
+):
+    _require_csrf(csrf_token, llmesh_csrf)
     owner_id = storage.authenticate_owner(api_key)
     if not owner_id:
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid API Key"})
+        # Re-render login with the same csrf token so the user can retry.
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Invalid API Key", "csrf_token": csrf_token},
+        )
 
     # Mint an opaque session token bound to the owner. Never expose the
     # owner_id in the cookie — a leaked owner_id must not grant session access.
@@ -1464,10 +2000,22 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
         for name, count in sorted(model_counts.items(), key=lambda item: (-item[1], item[0]))
     ]
 
+    # D064: deduped union of image_models advertised by this owner's nodes.
+    # Empty list → the dashboard image-gen card hides itself (template guard).
+    image_models_set: set[str] = set()
+    for n in owner_nodes:
+        if getattr(n.resources, "image_available", False):
+            for m in getattr(n.resources, "image_models", []):
+                image_models_set.add(m)
+    image_models_list = sorted(image_models_set)
+
     # Calculate base_url from request
     base_url = str(request.base_url).rstrip('/')
 
-    return templates.TemplateResponse(
+    existing_csrf = request.cookies.get(CSRF_COOKIE_NAME)
+    csrf = existing_csrf or secrets.token_urlsafe(32)
+
+    response = templates.TemplateResponse(
         "dashboard.html",
         {
             "request": request,
@@ -1475,25 +2023,36 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
             "owner_id": owner_id,
             "current_time": time.time(),
             "available_models": available_models,
+            "image_models": image_models_list,
             "base_url": base_url,
-            "version": APP_VERSION
+            "version": APP_VERSION,
+            "csrf_token": csrf,
         }
     )
+    if not existing_csrf:
+        response.set_cookie(
+            key=CSRF_COOKIE_NAME, value=csrf,
+            httponly=True, secure=True, samesite="Strict",
+        )
+    return response
 
 @app.post("/dashboard/request_inference")
 async def dashboard_submit_inference(
     request: Request,
     prompt: str = Form(...),
     model: str = Form(...),
-    llmesh_session: str | None = Cookie(None)
+    csrf_token: str = Form(...),
+    llmesh_session: str | None = Cookie(None),
+    llmesh_csrf: str | None = Cookie(None),
 ):
+    _require_csrf(csrf_token, llmesh_csrf)
     owner_id = _resolve_session(llmesh_session)
     if not owner_id:
         return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
     # Reuse the JSON logic by building the Pydantic model
     try:
         inf_req = InferenceRequest(owner_id=owner_id, prompt=prompt, model=model)
-        result = _route_inference(inf_req, stream=True)
+        result = await _route_inference(inf_req, stream=True)
         
         # Redirect the user to the polling page for this specific task
         return RedirectResponse(
@@ -1503,6 +2062,95 @@ async def dashboard_submit_inference(
     except HTTPException as e:
         # If no nodes available, show a simple error
         return HTMLResponse(f"<h3>Error: {e.detail}</h3><a href='/dashboard'>Back</a>", status_code=e.status_code)
+
+@app.post("/dashboard/request_image")
+async def dashboard_submit_image(
+    request: Request,
+    prompt: str = Form(...),
+    model: str = Form(...),
+    size: str = Form("square"),
+    quality: str = Form("draft"),
+    csrf_token: str = Form(...),
+    llmesh_session: str | None = Cookie(None),
+    llmesh_csrf: str | None = Cookie(None),
+):
+    """D064: dashboard image-gen submit. Synchronous — waits for the agent to
+    return base64 PNG and renders it inline in a result page. SOHO operator
+    UX: one form, one result. No SSE / polling / history persistence in v1.
+    """
+    _require_csrf(csrf_token, llmesh_csrf)
+    owner_id = _resolve_session(llmesh_session)
+    if not owner_id:
+        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+
+    try:
+        # Validate size at this layer too — Form() doesn't enforce Literal.
+        req = ImageGenerationRequest(
+            model=model, prompt=prompt, size=size, quality=quality, n=1,
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            f"<h3>Invalid request: {exc}</h3><a href='/dashboard'>Back</a>",
+            status_code=400,
+        )
+
+    try:
+        task_response = await _route_image(req, owner_id)
+    except HTTPException as e:
+        msg = e.detail if isinstance(e.detail, str) else json.dumps(e.detail)
+        return HTMLResponse(
+            f"<h3>Error: {msg}</h3><a href='/dashboard'>Back</a>",
+            status_code=e.status_code,
+        )
+
+    queued_task = tasks.get_task_status(task_response.node_assigned, task_response.task_id)
+    if queued_task is None:
+        return HTMLResponse("Task not found after queuing", status_code=500)
+    try:
+        await asyncio.wait_for(queued_task.done_event.wait(), timeout=IMAGE_TASK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return HTMLResponse(
+            f"<h3>Image generation timed out after {IMAGE_TASK_TIMEOUT_S:.0f}s</h3>"
+            f"<a href='/dashboard'>Back</a>",
+            status_code=504,
+        )
+
+    if queued_task.status != "completed":
+        return HTMLResponse(
+            f"<h3>Backend error: {queued_task.result}</h3><a href='/dashboard'>Back</a>",
+            status_code=502,
+        )
+
+    images = queued_task.result or []
+    metrics.log_image_event(
+        owner_id=owner_id,
+        node_id=task_response.node_assigned,
+        model=req.model,
+        status="success",
+        duration_ms=int((time.time() - queued_task.start_time) * 1000),
+        image_count=len(images),
+        size=queued_task.payload.get("size", ""),
+        steps=int(queued_task.payload.get("steps", 0) or 0),
+        quality_tier=queued_task.payload.get("quality", "draft"),
+    )
+    # Render inline. Each base64 PNG → an <img> tag with download link.
+    image_blocks = "".join(
+        f'<div class="mb-3"><img src="data:image/png;base64,{b64}" class="img-fluid border rounded" '
+        f'alt="Generated image" /><a class="btn btn-sm btn-outline-secondary mt-2" '
+        f'download="llmesh-{req.model}.png" href="data:image/png;base64,{b64}">Download PNG</a></div>'
+        for b64 in images
+    )
+    return HTMLResponse(
+        f"""<!doctype html><html><head><title>Image generated — LLMesh</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body class="bg-light"><div class="container py-4">
+<h3>Image generated</h3>
+<p class="text-muted small">Model: <code>{req.model}</code> &middot; Size: <code>{queued_task.payload.get('size')}</code> &middot; Quality: <code>{req.quality}</code></p>
+{image_blocks}
+<a href="/dashboard" class="btn btn-primary mt-3">Back to dashboard</a>
+</div></body></html>"""
+    )
+
 
 @app.get("/dashboard/task/{node_id}/{task_id}", response_class=HTMLResponse)
 async def dashboard_task_status_view(request: Request, node_id: str, task_id: str, llmesh_session: str | None = Cookie(None)):

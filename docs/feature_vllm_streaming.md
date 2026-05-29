@@ -139,10 +139,10 @@ Hub side: zero change. `_real_sse_generator` consumes as today.
 - **Implementation**: agent counts `delta.content` chunks as fallback (`usage_source: "estimated"` flag in done meta). `tokens_p=0` with explicit flag, hub displays `~` prefix.
 - **Tests**: simulated disconnect after 50 deltas → done frame has tokens_c=50, source=estimated.
 
-### HP-2 — STREAM_CHUNK_TIMEOUT during vLLM cold start
-- First token can take 2-5s while model loads. If hub timeout is absolute (not per-chunk), stream dies before first token.
-- **Implementation**: read `lib/hub/server.py` `STREAM_CHUNK_TIMEOUT` semantics. If absolute → emit keepalive frame (empty chunk, special meta) every 1s during gap. If per-chunk reset → no action needed, document.
-- **Tests**: simulated 5s pre-token delay → consumer not timed out.
+### HP-2 — STREAM_CHUNK_TIMEOUT during vLLM cold start ✓ RESOLVED (2026-05-28)
+- First token can take 2-5s while model loads. Question was whether hub timeout is absolute (total stream budget) or per-chunk (resets each token).
+- **Verified**: per-chunk reset. `lib/hub/server.py:454` — `asyncio.wait_for(task.stream_queue.get(), timeout=STREAM_CHUNK_TIMEOUT)` sits inside `while True:` in `_real_sse_generator`, so each iteration arms a fresh timer. Default `STREAM_CHUNK_TIMEOUT` is `300.0` seconds (line 183), not 30s as the original D-001 §1 question claimed. vLLM's 2-5s first-token gap is well under 300s budget.
+- **Action taken**: no keepalive frame needed; documented in `.qcoda/features/feature_streaming.md` §Timeout & Error Handling. D-001 §1 closed.
 
 ### HP-3 — TPS metric robustness
 - TPS using flush-to-flush time → slow hub POST inflates time → batch shrinks → more POSTs → death spiral.
@@ -291,7 +291,7 @@ D040 ships D041 inside it (StreamBatcher is foundation, not optional). Adaptive 
 
 ## Open questions (resolve before COMMITTED)
 
-- [ ] `STREAM_CHUNK_TIMEOUT` semantics — absolute or per-chunk? Decide HP-2 keepalive design.
+- [x] `STREAM_CHUNK_TIMEOUT` semantics — per-chunk reset, default 300s. No keepalive needed. Resolved 2026-05-28. See HP-2.
 - [ ] vLLM version detection viable, or always assume `include_usage` and treat absence as known case?
 - [ ] Ollama refactor onto `StreamBatcher` — separate decision after D040 ships, or bundled?
 - [ ] Metrics surface (current batch size, POST/s) — out of scope for D040, follow-up decision?

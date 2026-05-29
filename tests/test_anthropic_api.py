@@ -444,18 +444,33 @@ def test_anthropic_sdk_compat():
 # /tasks/status auth tests
 # ---------------------------------------------------------------------------
 
-def test_anthropic_streaming_rejected():
-    """POST /v1/messages with stream=true must return 400 with actionable error."""
+def test_anthropic_streaming_works():
+    """POST /v1/messages with stream=true returns the canonical Anthropic
+    SSE event sequence per D061 (supersedes the original D028-era reject test).
+
+    Unit-level coverage of the event generator lives in
+    tests/unit/test_anthropic_streaming.py — this integration test guards the
+    end-to-end wire shape through the real hub + fake node.
+    """
     r = httpx.post(
         f"{HUB_BASE}/v1/messages",
         json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64, "stream": True},
         headers={"x-api-key": API_KEY},
-        timeout=5,
+        timeout=10,
     )
-    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text}"
-    body = r.json()
-    assert "detail" in body
-    assert "/v1/chat/completions" in str(body["detail"]), f"error should point to /v1/chat/completions: {body}"
+    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text[:200]}"
+    body = r.text
+    # Canonical Anthropic Messages SSE sequence per
+    # https://docs.anthropic.com/en/api/messages-streaming
+    for event_name in (
+        "event: message_start",
+        "event: content_block_start",
+        "event: content_block_delta",
+        "event: content_block_stop",
+        "event: message_delta",
+        "event: message_stop",
+    ):
+        assert event_name in body, f"missing {event_name} in SSE body: {body[:300]}"
 
 
 def test_task_status_no_auth():

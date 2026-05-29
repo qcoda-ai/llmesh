@@ -13,7 +13,72 @@ Based on our recent implementation phases, the system is designed around two pri
 
 Our project history reflects ongoing architectural evolution, particularly focusing on migrating from a single-owner MVP model to a scalable, multi-tenant SaaS architecture.
 
-## Getting Started
+## Quick Start (Docker — recommended)
+
+Hub-side install via Docker Compose. Brings up the FastAPI hub + a Postgres-backed session store. Agents still run on each compute host bare-metal (they need GPU/Ollama/MLX access on the host, so they don't containerise sensibly).
+
+### Prerequisites
+
+- Docker + Docker Compose v2 (Docker Desktop on macOS/Windows, `docker-compose-plugin` on Linux)
+- At least one machine running [Ollama](https://ollama.com/) (or vLLM / MLX) — this is the agent side; not Docker
+- `.env` and `server_config.json` files (templates below)
+
+### Steps
+
+1. Clone the repository and `cd` in.
+
+2. Create `server_config.json` from the example:
+   ```bash
+   cp server_config.example.json server_config.json
+   ```
+   Edit it — replace the placeholder API key with a unique secret you generate yourself. The hub refuses to start with the shipped sample keys; this is enforced per `.qcoda/decisions.md::D013`.
+
+3. Create `.env` with the Postgres credentials Docker Compose requires:
+   ```bash
+   cat > .env <<'EOF'
+   POSTGRES_DB=llmesh
+   POSTGRES_USER=llmesh
+   POSTGRES_PASSWORD=<pick a strong password>
+   EOF
+   ```
+
+4. Bring up the hub:
+   ```bash
+   docker compose up -d
+   ```
+   First boot pulls Postgres 16-alpine and builds the hub image (~2-3 min). Subsequent starts are ~5s. Hub listens on `http://localhost:8000`.
+
+5. Verify:
+   ```bash
+   curl -s http://localhost:8000/health
+   # → {"status":"ok"}
+   ```
+
+6. Start an agent on a compute host (any machine with Ollama / vLLM / MLX installed). Agents always run bare-metal, even when the hub is in Docker — see [§"Start an Agent (Node)"](#2-start-an-agent-node) below for the agent install.
+
+### What Compose ships
+
+- `hub` — FastAPI broker on port 8000. Reads `server_config.json` (volume-mounted read-only) and `.env`.
+- `postgres` — Postgres 16-alpine, persisted via the `llmesh_pg` named volume. Survives `docker compose down`; wiped by `docker compose down -v`.
+- Named volumes: `llmesh_pg` (session DB), `llmesh_data` (metrics SQLite), `llmesh_hf_cache` (compression model weights when `SESSION_MEMORY_MODE != cutoff`).
+- Default `SESSION_BACKEND=postgres` — Docker path opts you into shared session storage. For SQLite, use the bare-metal install below.
+
+### Common operations
+
+```bash
+docker compose logs -f hub        # tail hub logs
+docker compose restart hub        # apply server_config.json changes (no hot-reload)
+docker compose down               # stop, keep volumes
+docker compose down -v            # stop + wipe Postgres + metrics
+```
+
+For nginx fronting, Postgres tuning, and Redis-backed rate limiting across multiple hub instances, see [`docs/nginx_deployment.md`](docs/nginx_deployment.md) and [`docs/postgres.md`](docs/postgres.md).
+
+---
+
+## Bare-metal install (alternative)
+
+Use this when you want SQLite (default), are developing on the hub itself, or are installing the agent on a compute host.
 
 ### Prerequisites
 
@@ -403,16 +468,18 @@ response = client.messages.create(
 
 LLMesh is an early release. The following behaviors are intentional trade-offs or tracked improvements. Read before deploying to anything you care about.
 
+> For a single-page taxonomy of every documented gap (API parameters, backends, deployment, observability, etc.), see [`docs/known_limitations.md`](docs/known_limitations.md). This section focuses on the deployment-time caveats most likely to bite operators; that doc is the evaluator's reference.
+
 ### Reliability
 
-- **In-flight tasks do not survive hub restart.** The task queue is in-memory. A hub restart drops every pending and claimed task; clients blocked on `/tasks/status` receive a timeout and must retry. Persistent queue recovery is on the roadmap.
-- **Streaming tasks cannot be recovered.** Even once the persistent queue lands, an SSE stream in progress when the hub restarts will be cut — the async primitives (`done_event`, `stream_queue`) are never persisted by design. Clients should expect to retry on `502`/`503` from streaming endpoints.
+- **Pending and claimed tasks survive hub restart** (since 2026-05-28, D003 + D053). The task queue is persisted to SQLite at `TASK_DB` (defaults to `SESSION_DB`, then `./tasks.db`). On startup, claimed tasks reset to pending so a fresh node picks them up; pending tasks remain queued. Clients blocked on `/tasks/status` during the restart window receive a transient timeout and should retry.
+- **Streaming tasks cannot be recovered.** An SSE stream in progress when the hub restarts is cut — the async primitives (`done_event`, `stream_queue`) are never persisted by design. Clients should expect to retry on `502`/`503` from streaming endpoints.
 - **Hub is single-instance.** There is no clustering, HA, or leader election. Running two hubs against the same database is not supported and will produce undefined behavior. For multi-instance session sharing use the Postgres backend plus a Redis-backed rate-limit store (`RATE_LIMIT_STORAGE_URL=redis://...`), but only one hub should process tasks.
 - **Agent reconnect is HTTP polling.** Agents poll `/tasks/pending` every 5 seconds. Task dispatch latency is bounded by this interval; WebSocket/long-poll transport is deferred.
 
 ### Security
 
-- **The dashboard forms do not yet implement CSRF tokens.** Same-site cookies (`SameSite=Strict`) block the common cross-origin attack, but if you deploy the dashboard on a bare IP or on a subdomain of a domain that hosts untrusted content, that defense weakens. Do not expose the dashboard to an untrusted network without a reverse proxy that adds its own auth layer. CSRF tokens are tracked as the next security improvement.
+- **Dashboard POST forms are CSRF-protected** (since 2026-05-28, D055) using the double-submit cookie pattern. An `llmesh_csrf` cookie (HttpOnly, Secure, SameSite=Strict) is issued on first visit to `/login` or `/dashboard` and mirrored into a hidden `csrf_token` form input. The server validates the two values match with `secrets.compare_digest` before accepting POSTs. This is defense-in-depth alongside the existing SameSite=Strict session cookie — even if a future deployment weakens SameSite (bare-IP host, subdomain of an untrusted-content site), the token check still blocks the attack. `GET /logout` is not yet token-protected; it remains GET-driven so the worst-case attack is logging a victim out (annoying, not harmful). Convert to POST in a future PR if the risk profile changes.
 - **Rate limit storage defaults to in-memory.** On a single-instance hub this is correct. If you run multiple hubs behind a load balancer, set `RATE_LIMIT_STORAGE_URL=redis://...` — otherwise each instance tracks its own counters and the limits are effectively multiplied by the number of instances.
 - **Session history is not encrypted at rest.** Conversation turns are stored in cleartext in SQLite or Postgres. Encryption is the operator's responsibility: use LUKS, Postgres TDE, encrypted EBS volumes, or whatever your deployment target provides. Application-layer encryption is tracked for a future release.
 - **Dashboard cookies are opaque session tokens** (since 2026-04-08) but sessions live in memory only — they do not survive a hub restart. Users will be asked to log in again after every deploy. This is consistent with how node tokens behave.

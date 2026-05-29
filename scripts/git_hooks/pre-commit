@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
-# pre-commit hook — Ledger Law (warn-only) + secrets scan (blocking).
+# pre-commit hook — Ledger Law (BLOCKING per D065) + secrets scan (blocking).
 # Installed via: bash scripts/install_git_hooks.sh
 # Source of truth: scripts/git_hooks/pre-commit (versioned).
 
 set -e
 
-# 1. Ledger Law — warn-only during D042 first-week rollout.
-#    To flip to blocking: change the `if !` block to `python ... || exit 1`
-#    and log a follow-up decision.
+# 1. Ledger Law — BLOCKING per D065 (2026-05-28).
+#    Was warn-only during D042 first-week rollout; flipped to blocking after
+#    no false-positive incidents observed across the rollout window. To revert
+#    temporarily for an emergency commit: pass `--no-verify` to git commit and
+#    open a follow-up decision explaining the bypass.
 if ! python scripts/validate_decisions.py; then
     echo ""
-    echo "  ⚠  Ledger Law check failed — currently WARN-ONLY (D042 first-week mode)."
-    echo "  ⚠  Resolve the violation; this hook will flip to BLOCKING in a future decision."
+    echo "─────────────────────────────────────────────────────"
+    echo "  ❌ pre-commit BLOCKED — Ledger Law violation"
+    echo "─────────────────────────────────────────────────────"
     echo ""
+    echo "  Resolve the OPEN decision or doc-coverage gap, re-stage, and retry."
+    echo "  Emergency bypass: git commit --no-verify (open a follow-up decision)."
+    echo ""
+    exit 1
 fi
 
 # 2. Secrets scan — gitleaks against staged changes (always blocking).

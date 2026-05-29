@@ -14,17 +14,19 @@ _db_init_lock = asyncio.Lock()
 
 _DDL = [
     """CREATE TABLE IF NOT EXISTS inference_events (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp         REAL    NOT NULL,
-        user_id           TEXT    NOT NULL,
-        node_id           TEXT    NOT NULL,
-        model             TEXT    NOT NULL,
-        status            TEXT    NOT NULL,
-        duration_ms       REAL,
-        tokens_prompt     INTEGER,
-        tokens_completion INTEGER,
-        is_compression    INTEGER DEFAULT 0,
-        kind              TEXT DEFAULT 'chat'
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp           REAL    NOT NULL,
+        user_id             TEXT    NOT NULL,
+        node_id             TEXT    NOT NULL,
+        model               TEXT    NOT NULL,
+        status              TEXT    NOT NULL,
+        duration_ms         REAL,
+        tokens_prompt       INTEGER,
+        tokens_completion   INTEGER,
+        is_compression      INTEGER DEFAULT 0,
+        kind                TEXT DEFAULT 'chat',
+        stream_batches      INTEGER DEFAULT 0,
+        stream_final_size   INTEGER DEFAULT 0
     )""",
     "CREATE INDEX IF NOT EXISTS idx_inf_user_ts ON inference_events(user_id, timestamp)",
     """CREATE TABLE IF NOT EXISTS node_snapshots (
@@ -45,6 +47,22 @@ _DDL = [
         first_seen REAL NOT NULL,
         last_seen  REAL NOT NULL
     )""",
+    # D064 — image-gen events live in a separate table because the token-shape
+    # of `inference_events` does not capture image_count / resolution / steps.
+    """CREATE TABLE IF NOT EXISTS image_events (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp    REAL    NOT NULL,
+        owner_id     TEXT    NOT NULL,
+        node_id      TEXT    NOT NULL,
+        model        TEXT    NOT NULL,
+        status       TEXT    NOT NULL,
+        duration_ms  REAL,
+        image_count  INTEGER NOT NULL DEFAULT 1,
+        size         TEXT,
+        steps        INTEGER,
+        quality_tier TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_img_owner_ts ON image_events(owner_id, timestamp)",
 ]
 
 # Migration statements — run best-effort on existing DBs.
@@ -52,6 +70,11 @@ _MIGRATIONS = [
     "ALTER TABLE inference_events ADD COLUMN is_compression INTEGER DEFAULT 0",
     "ALTER TABLE node_registry ADD COLUMN context_size INTEGER",
     "ALTER TABLE inference_events ADD COLUMN kind TEXT DEFAULT 'chat'",
+    # D068: batcher telemetry columns. Best-effort additive — failures are
+    # swallowed in _apply_migrations because they typically mean the column
+    # already exists from a prior run.
+    "ALTER TABLE inference_events ADD COLUMN stream_batches INTEGER DEFAULT 0",
+    "ALTER TABLE inference_events ADD COLUMN stream_final_size INTEGER DEFAULT 0",
 ]
 
 
@@ -228,12 +251,19 @@ async def _flush_buffer() -> None:
         (e["timestamp"], e["user_id"], e["node_id"], e["model"], e["status"],
          e.get("duration_ms"), e.get("tokens_prompt", 0), e.get("tokens_completion", 0),
          1 if e.get("is_compression") else 0,
-         e.get("kind", "chat"))
+         e.get("kind", "chat"),
+         e.get("stream_batches", 0), e.get("stream_final_size", 0))
         for e in events if e.get("event") == "inference"
     ]
     snap_rows = [
         (e["timestamp"], e["user_id"], e.get("active_nodes", 0))
         for e in events if e.get("event") == "node_snapshot"
+    ]
+    img_rows = [
+        (e["timestamp"], e["owner_id"], e["node_id"], e["model"], e["status"],
+         e.get("duration_ms"), e.get("image_count", 1), e.get("size"),
+         e.get("steps"), e.get("quality_tier"))
+        for e in events if e.get("event") == "image"
     ]
 
     try:
@@ -241,8 +271,9 @@ async def _flush_buffer() -> None:
             await db.executemany(
                 "INSERT INTO inference_events "
                 "(timestamp, user_id, node_id, model, status, duration_ms, "
-                " tokens_prompt, tokens_completion, is_compression, kind) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " tokens_prompt, tokens_completion, is_compression, kind, "
+                " stream_batches, stream_final_size) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 inf_rows
             )
         if snap_rows:
@@ -250,7 +281,15 @@ async def _flush_buffer() -> None:
                 "INSERT INTO node_snapshots (timestamp, user_id, active_nodes) VALUES (?,?,?)",
                 snap_rows
             )
-        if inf_rows or snap_rows:
+        if img_rows:
+            await db.executemany(
+                "INSERT INTO image_events "
+                "(timestamp, owner_id, node_id, model, status, duration_ms, "
+                " image_count, size, steps, quality_tier) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                img_rows
+            )
+        if inf_rows or snap_rows or img_rows:
             await db.commit()
     except Exception:
         logger.exception("metrics: batch insert failed, %d events dropped", len(events))
@@ -258,14 +297,17 @@ async def _flush_buffer() -> None:
 
 def log_inference_event(user_id: str, node_id: str, model: str, status: str,
                         duration_ms: float, tokens_prompt: int, tokens_completion: int,
-                        is_compression: bool = False, kind: str = "chat") -> None:
+                        is_compression: bool = False, kind: str = "chat",
+                        stream_batches: int = 0, stream_final_size: int = 0) -> None:
     """Queue an inference event for the next batch flush. Sync-by-design:
     one list.append, no await, no coroutine spawning. Safe to call from any
     context; the flush task picks it up on the next tick.
 
-    `kind` distinguishes chat vs embedding traffic for analytics. Stored in
-    the buffer as a tag — the underlying schema is unchanged for now (D028
-    follow-up may add a column once we have a migration cadence)."""
+    `kind` distinguishes chat vs embedding traffic for analytics.
+    `stream_batches` + `stream_final_size` (D068) capture the agent's
+    `StreamBatcher` telemetry on streaming tasks; zero on non-streamed
+    inference. Lets operators see batcher convergence in the dashboard task
+    viewer without grepping agent logs."""
     _event_buffer.append({
         "event": "inference",
         "timestamp": time.time(),
@@ -278,6 +320,32 @@ def log_inference_event(user_id: str, node_id: str, model: str, status: str,
         "tokens_completion": tokens_completion,
         "is_compression": is_compression,
         "kind": kind,
+        "stream_batches": stream_batches,
+        "stream_final_size": stream_final_size,
+    })
+
+
+def log_image_event(owner_id: str, node_id: str, model: str, status: str,
+                    duration_ms: float, image_count: int,
+                    size: str, steps: int, quality_tier: str) -> None:
+    """D064: queue an image-gen event for the next batch flush.
+
+    Parallel to log_inference_event. Distinct table (`image_events`) because
+    the unit shape (image_count + pixels + steps + wall-seconds) is different
+    from tokens. Dashboard chart hooks pull from this table directly. D-002
+    audio (if/when it ships) gets its own `audio_events` table."""
+    _event_buffer.append({
+        "event": "image",
+        "timestamp": time.time(),
+        "owner_id": owner_id,
+        "node_id": node_id,
+        "model": model,
+        "status": status,
+        "duration_ms": duration_ms,
+        "image_count": image_count,
+        "size": size,
+        "steps": steps,
+        "quality_tier": quality_tier,
     })
 
 

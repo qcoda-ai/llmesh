@@ -38,11 +38,12 @@ def test_node_id_env_valid_underscore_separated():
 
 # --- invalid → fallback ------------------------------------------------------
 
-def test_node_id_env_with_slash_rejected(capsys):
-    with mock.patch.dict(os.environ, {"LLMESH_NODE_ID": "bad/value"}, clear=False):
-        assert agent_client._resolve_operator_node_id() is None
-    err = capsys.readouterr().err
-    assert "LLMESH_NODE_ID" in err and "ignored" in err
+def test_node_id_env_with_slash_rejected(caplog):
+    with caplog.at_level("WARNING", logger="llmesh.agent"):
+        with mock.patch.dict(os.environ, {"LLMESH_NODE_ID": "bad/value"}, clear=False):
+            assert agent_client._resolve_operator_node_id() is None
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "LLMESH_NODE_ID" in msgs and "ignored" in msgs
 
 
 def test_node_id_env_with_space_rejected():
@@ -88,9 +89,10 @@ def test_compute_node_fingerprint_hashes_when_env_unset():
     assert len(result) == len("node_") + 16
 
 
-def test_compute_node_fingerprint_hashes_when_env_invalid(capsys):
-    with mock.patch.dict(os.environ, {"LLMESH_NODE_ID": "in valid"}, clear=False):
-        result = agent_client.compute_node_fingerprint()
+def test_compute_node_fingerprint_hashes_when_env_invalid(caplog):
+    with caplog.at_level("WARNING", logger="llmesh.agent"):
+        with mock.patch.dict(os.environ, {"LLMESH_NODE_ID": "in valid"}, clear=False):
+            result = agent_client.compute_node_fingerprint()
     assert result.startswith("node_")
-    err = capsys.readouterr().err
-    assert "ignored" in err
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "ignored" in msgs

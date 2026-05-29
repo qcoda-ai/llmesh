@@ -75,16 +75,22 @@ def test_reject_sample_keys_raises_on_test_fixture_keys(leaked_key):
         config._reject_sample_keys({leaked_key: "owner_alpha"}, "server_config.json")
 
 
-def test_bypass_env_var_allows_sample_keys(monkeypatch, capsys):
-    """LLMESH_ALLOW_SAMPLE_KEYS=1 must bypass the guard but log a loud warning."""
+def test_bypass_env_var_allows_sample_keys(monkeypatch, caplog):
+    """LLMESH_ALLOW_SAMPLE_KEYS=1 must bypass the guard but log a loud warning.
+
+    D051 swapped the original `print()` for `logger.warning()`, so the message
+    lands in caplog (the `llmesh.hub.config` logger), not stdout.
+    """
+    import logging
     monkeypatch.setenv("LLMESH_ALLOW_SAMPLE_KEYS", "1")
-    # Must not raise
-    config._reject_sample_keys(
-        {"my_secret_key_1": "owner_alpha"}, "tests/fixtures/server_config.json"
-    )
-    captured = capsys.readouterr()
-    assert "LLMESH_ALLOW_SAMPLE_KEYS=1" in captured.out
-    assert "TEST-ONLY" in captured.out
+    with caplog.at_level(logging.WARNING, logger="llmesh.hub.config"):
+        # Must not raise
+        config._reject_sample_keys(
+            {"my_secret_key_1": "owner_alpha"}, "tests/fixtures/server_config.json"
+        )
+    msg = caplog.text
+    assert "LLMESH_ALLOW_SAMPLE_KEYS=1" in msg
+    assert "TEST-ONLY" in msg
 
 
 def test_bypass_env_var_only_accepts_exactly_1(monkeypatch):
