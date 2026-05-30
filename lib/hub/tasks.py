@@ -71,6 +71,11 @@ class Task:
         # without grepping agent logs.
         self.stream_batches: int = 0
         self.stream_final_size: int = 0
+        # D084: hub-side TTFT. Set once in the SSE generator on the first
+        # non-sentinel chunk. Remains None on non-streaming paths (blocking
+        # complete, embeddings, image-gen). Per-attempt observation — not
+        # persisted across hub restart.
+        self.ttft_ms: float | None = None
         self.start_time = time.time()
         self.created_at: float = time.time()
         self.session_id: str | None = None

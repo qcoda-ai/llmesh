@@ -85,7 +85,7 @@ def model_install_dir(model_id: str) -> Path:
     produced by `scripts/install_image_model.py` (D071) and consumed by
     mflux's `Flux1(model_path=...)`.
     """
-    from . import image_model_registry as reg
+    from lib.agent import image_model_registry as reg
     entry = reg.get(model_id)
     if entry is None:
         raise KeyError(f"unknown model_id: {model_id!r}")
@@ -95,7 +95,7 @@ def model_install_dir(model_id: str) -> Path:
 def missing_repo_files(model_id: str) -> list[str]:
     """Return the list of registry `repo_files` not present on disk for
     `model_id`. Empty list = complete install."""
-    from . import image_model_registry as reg
+    from lib.agent import image_model_registry as reg
     entry = reg.get(model_id)
     if entry is None:
         return []
@@ -118,7 +118,7 @@ def discover_installed_models() -> list[str]:
     flow once that path is built (D-003 §"Registry drift" recommendation
     (b), deferred per D064).
     """
-    from . import image_model_registry as reg
+    from lib.agent import image_model_registry as reg
 
     base = _models_dir()
     if not base.exists():

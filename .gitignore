@@ -80,12 +80,20 @@ Thumbs.db
 alembic/versions/*.pyc
 .aider*
 
-# Local deployment templates with operator-specific values (D016)
-# Track only the *.example versions; the populated copies stay local.
-nodeclient.service
-llmesh.service
-llmesh-nginx.conf
+# Local deployment templates with operator-specific values (D016).
+# Track only the *.example versions and the canonical deploy/ artefacts;
+# operator-populated copies left at repo root stay local.
+/nodeclient.service
+/llmesh.service
+/llmesh-nginx.conf
 !*.example
+!deploy/*.service
+
+# Operator-owned env files (gitignored; *.example tracked, see D091).
+.env
+.env.agent
+deploy/.env
+deploy/.env.agent
 
 # Lab run artefacts — operator-generated trend data, not source.
 # Track only `.gitkeep` so directory persists.

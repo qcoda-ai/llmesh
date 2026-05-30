@@ -1,8 +1,10 @@
-# Image Generation (v0.2)
+# Image Generation (v0.2 — BETA)
 
-LLMesh supports OpenAI-compatible image generation via the local `mflux` backend on Apple Silicon Macs. v1 ships with the following constraints (see `.qcoda/decisions.md::D064`):
+> **BETA — stability advisory.** Image generation is marked BETA as of 2026-05-30 per `decisions.md::D083`. An M1 Ultra 64 GB host kernel-panicked and hard-rebooted during a FLUX-schnell run after co-running other MLX workloads (osaurus, mlx-lm). Until a second incident clarifies the root cause, treat image gen as production-unsafe on any Mac with less than 64 GB UMA, and quit every other large LLM/MLX workload before generating. 128 GB Mac Studio recommended for production. See §"Memory pressure" below.
 
-- **Apple Silicon Macs only.** Intel Macs, Linux, and Windows are not supported in v1. Future versions may add ComfyUI / Draw Things / A1111 drivers.
+LLMesh supports OpenAI-compatible image generation via the local `mflux` backend on Apple Silicon Macs. v1 ships with the following constraints (see `.qcoda/decisions.md::D064` and `decisions.md::D083` for the BETA sysreq tightening):
+
+- **Apple Silicon Macs only, 64 GB UMA minimum.** M1/M2/M3 with 64 GB or more unified memory. Below 64 GB is not v1-supported (see D083). Intel Macs, Linux, and Windows are not supported in v1. Future versions may add ComfyUI / Draw Things / A1111 drivers.
 - **Operator-explicit model installs.** Models are never auto-downloaded. You run `llmesh-agent install-image-model <id>` once per model.
 - **No content filter shipped.** LLMesh does not run safety classification on generated images. Operator policy applies. This is an explicit decision (D064) — for SOHO deployments with shared devices, consider this carefully before exposing image gen.
 - **No model substitution.** If a client requests a model not installed on any node, the hub returns `404 model_not_available`.
@@ -136,11 +138,15 @@ Both the agent (`lib/agent/client.py`) and the install CLI (`scripts/install_ima
 
 **Default** (`~/.llmesh/models/image/`) is used if neither is set. On Macs where `~` lives on a near-full Data volume, point this at an external drive instead — the install CLI refuses to install if post-install free disk would drop below 10 GB.
 
-### Memory pressure
+### Memory pressure (BETA — read this before enabling)
 
-- mflux runs in-process with the agent. Loaded model weights stay resident.
-- The agent loads quantized (`quantize=8`) — effective working set is roughly half the on-disk size.
-- On 16 GB Macs, FLUX is at the routing floor and may fail or be very slow under any other load. 32 GB+ is the comfortable minimum; 64 GB+ runs both FLUX-schnell and FLUX-dev without paging pressure.
+- **Published floor: 64 GB UMA Apple Silicon.** Below 64 GB is not v1-supported. The registry's `min_vram_gb = 16` is the model-only working-set floor; **it is not the system requirement** — see `decisions.md::D083`.
+- **Do not co-run other large MLX/LLM workloads.** mflux holds FLUX weights resident in UMA for the lifetime of the agent process. Combined with another large LLM RSS (e.g. Ollama with a 30 GB+ model loaded, mlx-lm.server, vLLM, a second Python inference process), total resident memory plus transient activations saturates the macOS VM compressor pool. The compressor absorbs the overflow at the cost of all available CPU; once compressor-driven scheduling stalls exceed ~94 seconds, the kernel `watchdogd` watchdog trips and the machine **kernel-panics + hard-reboots**. This was observed on M1 Ultra 64 GB on 2026-05-29 23:12 with three large LLM processes resident (Python 46.7 GB mflux/agent, Python 37.8 GB, Ollama 35.5 GB) — top-3 sum ~120 GB on a 64 GB host. Quit other LLM services on the host before generating.
+- **The panic is not a simple OOM kill.** Signature in the panic log is `watchdog timeout: no checkins from watchdogd in N seconds` and `memoryPressure: false` even though `free` is effectively zero — the compressor is doing the work but eating the CPU. A naive `vm_stat` free-page check from userspace will report "fine" right before this happens.
+- **Production recommendation: M2/M3 Max or Ultra with 128 GB UMA.** Gives headroom for FLUX-dev + concurrent chat workloads without compressor saturation.
+- mflux runs in-process with the agent. Loaded model weights stay resident for the agent's lifetime.
+- The agent loads quantized (`quantize=8`) — effective working set is roughly half the on-disk size, but transient activations during the diffusion steps push peak well above the resident footprint.
+- After a panic, pull `/Library/Logs/DiagnosticReports/*.panic` and file a lessons entry. Check `compressorSize` × 16 KB and the top `residentMemoryBytes` per `processByPid` — these confirm or rule out the compressor-saturation pattern documented in D083.
 
 ### `HF_HUB_OFFLINE=1`
 
@@ -189,12 +195,15 @@ Deferred to v2 or later (per D064):
 
 **Agent log shows "mflux not available"** — `pip install mflux` on the agent host, restart agent.
 
+**Agent registers `image_available: False` even though mflux is installed and models are on disk** — check `/tmp/com.qcoda.mesh.err` (or your equivalent) for `WARNING llmesh.agent: image probe: ...` lines. The probe failure paths log at WARNING and name the cause: missing pip dep, missing/empty models directory, filesystem permission denied (launchd-spawned agents on macOS need TCC Full Disk Access to read external volumes — System Settings → Privacy & Security → Files and Folders → your terminal/launcher), or unexpected exceptions. See `.qcoda/decisions.md::D078` for the relative-import variant that hit the M1 Ultra test bed on 2026-05-29.
+
 ---
 
 ## References
 
 - `.qcoda/decisions.md::D064` — scope-lock decision (FLUX-only, mflux backend)
 - `.qcoda/decisions.md::D071` — install layout fix (diffusers multi-file + curl-per-file)
+- `.qcoda/decisions.md::D078` — probe failure now logs at WARNING + absolute import fix
 - `.qcoda/discussions.md::D-003` — exploration (superseded)
 - `.qcoda/labs/LAB-005-image-gen-feasibility/` — verification harness
 - `lib/hub/server.py` — `/v1/images/generations` endpoint + `_route_image`

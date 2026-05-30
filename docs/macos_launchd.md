@@ -75,8 +75,8 @@ A template is provided at `com.qcoda.mesh.plist.example` in the repository root.
 | `WorkingDirectory` | Sets CWD so `.env` and relative paths resolve correctly |
 | `RunAtLoad` | Start immediately when the agent is loaded |
 | `KeepAlive` | Restart the agent automatically if it exits or crashes |
-| `StandardOutPath` | Where `print()` / stdout output is written |
-| `StandardErrorPath` | Where errors and tracebacks are written |
+| `StandardOutPath` | Normal operational logs (INFO/DEBUG) — registration, heartbeat, task chatter. Per D080 the agent's logger routes everything `< WARNING` here. |
+| `StandardErrorPath` | Warnings, errors, tracebacks only. Per D080 anything in this file is a signal worth reading. |
 
 ---
 
@@ -160,8 +160,8 @@ Interpret the output:
 Open two terminal tabs:
 
 ```bash
-tail -f /tmp/com.qcoda.mesh.log   # stdout
-tail -f /tmp/com.qcoda.mesh.err   # stderr / errors
+tail -f /tmp/com.qcoda.mesh.log   # normal operation (INFO/DEBUG) — D080
+tail -f /tmp/com.qcoda.mesh.err   # warnings + errors only — D080
 ```
 
 ### Step 6 — Test KeepAlive Behaviour
@@ -243,6 +243,12 @@ ls /path/to/llmesh-repo/.venv/bin/python
 # In the plist:
 <string>/path/to/llmesh-repo/.venv/bin/python</string>
 ```
+
+### Capability Silently Disabled (image-gen, etc.) — `see decisions.md::D078`
+
+If a backend or capability seems to exist locally but the agent registers it as unavailable, watch for `WARNING llmesh.agent: image probe: ...` lines in `/tmp/com.qcoda.mesh.err`. The probe path explains *why* it failed: missing pip dep, missing model directory, filesystem permission denied (launchd-spawned agents need TCC access for external volumes — System Settings → Privacy & Security → Files and Folders), or an unexpected exception.
+
+If a probe raises `ImportError('attempted relative import with no known parent package')`, the underlying module is using `from . import …` while the agent is launched as a script (`python lib/agent/client.py`) rather than as a module (`python -m lib.agent.client`). Convert that import to absolute (`from lib.agent import …`); D078 fixed this for the image probe, but it is a general anti-pattern for entry-point modules. See also `.qcoda/lessons.md`.
 
 ### The .env File Is Not Being Read
 

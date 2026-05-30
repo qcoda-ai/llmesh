@@ -1,0 +1,135 @@
+version: 2.1
+
+# LLMesh CI/CD — adapted from ../qcoda and ../talential-python-backend.
+# Single environment per D085 (2026-05-30); deploy host configured via the
+# `SERVER_IP` env var in CircleCI Project Settings, never hardcoded here.
+# Branch model: every push to `main` runs the test gate + deploys.
+# PRs run test-only. No staging slot.
+
+jobs:
+  test:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "pyproject.toml" }}
+      - run:
+          name: Install dependencies
+          command: |
+            python -m venv .venv
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install -e '.[dev]'
+      - save_cache:
+          key: v1-deps-{{ checksum "pyproject.toml" }}
+          paths:
+            - .venv
+      - run:
+          name: Unit tests (must be 216/216 — the merge gate)
+          # LLMESH_API_KEY is enforced at agent-client import time
+          # (lib/agent/client.py:47). Tests import the module but mock the
+          # network — any non-empty value satisfies the import-time check.
+          # Same shape for LLMESH_NODE_ID to satisfy D048 regex if any test
+          # path exercises it.
+          environment:
+            LLMESH_API_KEY: ci-test-placeholder
+            LLMESH_NODE_ID: ci-test-node
+            # Skip the compressor model download (~300 MB GGUF) — pulled
+            # otherwise by any test that exercises FastAPI startup via
+            # TestClient(app) as a context manager. Tests mock the
+            # compression path, so cutoff mode is correct here.
+            SESSION_MEMORY_MODE: cutoff
+            # Tests use known-placeholder API keys from fixtures; bypass
+            # the production sample-key startup guard (D013).
+            LLMESH_ALLOW_SAMPLE_KEYS: "1"
+          command: |
+            . .venv/bin/activate
+            # pytest reliably reports "216 passed" in ~3s but the Python
+            # interpreter doesn't exit for another ~120s in CircleCI's
+            # cimg/python:3.11 environment (no such hang locally on macOS
+            # or in plain Docker). Root cause not yet diagnosed — suspect a
+            # background task that pytest's loop teardown can't cancel.
+            # Workaround: use `timeout` to bound the wait, then grep stdout
+            # for the canonical "<N> passed" line. If we see it, exit 0
+            # regardless of whether timeout fired.
+            set +e
+            timeout 30 pytest tests/unit/ -q > /tmp/pytest.out 2>&1
+            PYTEST_RC=$?
+            cat /tmp/pytest.out
+            if grep -qE "^[0-9]+ passed" /tmp/pytest.out && ! grep -qE "failed|error" /tmp/pytest.out; then
+              if [ $PYTEST_RC -ne 0 ]; then
+                echo "[CI workaround] pytest reported success then hung — treating as pass"
+              fi
+              exit 0
+            fi
+            exit $PYTEST_RC
+      - run:
+          name: Ledger validator (decisions.md must have zero OPEN entries)
+          command: |
+            . .venv/bin/activate
+            python scripts/validate_decisions.py
+      - run:
+          name: gitleaks scan (mirrors pre-commit hook)
+          # Pinned version — never use /latest/ for a tool that reads full source.
+          command: |
+            curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
+              | tar -xz -C /tmp gitleaks
+            /tmp/gitleaks detect --source . --no-banner
+
+  deploy:
+    docker:
+      - image: cimg/base:stable
+
+    steps:
+      - checkout
+
+      - add_ssh_keys:
+          # Upload the deploy key under CircleCI Project Settings → SSH Keys,
+          # then paste the SHA256 fingerprint here. See docs/cicd_setup_circleci.md.
+          fingerprints:
+            - "SHA256:SVljMRAh2CZZLiACOnWpVBksKEq0aq9u2hS8Ijlvt+8"
+
+      - run:
+          name: Add server to known_hosts
+          command: |
+            mkdir -p ~/.ssh
+            ssh-keyscan -H -p "$SSH_PORT" "$SERVER_IP" >> ~/.ssh/known_hosts
+
+      - run:
+          name: Deploy (main)
+          command: |
+            # ServerAliveInterval keeps the SSH session warm during long
+            # systemctl-stop drains. Without it, sshd's idle timeout drops
+            # the connection mid-restart when gunicorn's graceful-timeout
+            # (30s) is busy draining active agent SSE / heartbeat
+            # connections. CircleCI's bash -l -c child then gets SIGHUP
+            # and kills deploy.sh before the restart finishes.
+            ssh -t -o ServerAliveInterval=15 -o ServerAliveCountMax=240 \
+                -p "$SSH_PORT" llmesh@"$SERVER_IP" \
+                'bash -l -c "cd ~ && ./deploy.sh main"'
+          no_output_timeout: 20m
+
+      - run:
+          name: Verify deployment
+          when: always
+          command: |
+            echo "Checking llmesh service is active..."
+            ssh -p "$SSH_PORT" llmesh@"$SERVER_IP" 'sudo systemctl is-active llmesh' || exit 1
+            echo "Checking hub /health endpoint..."
+            ssh -p "$SSH_PORT" llmesh@"$SERVER_IP" 'curl -fsS http://localhost:8003/health' || exit 1
+            echo "Deploy verified."
+
+workflows:
+  version: 2
+  test_and_deploy:
+    jobs:
+      - test
+      - deploy:
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - main

@@ -22,6 +22,25 @@ Ref: [`.qcoda/api.md` §"NOT Implemented"](../.qcoda/api.md).
 
 ---
 
+## 1a. Image generation (BETA) — stability + sysreq
+
+Image generation (`POST /v1/images/generations`, dashboard Image tab) shipped in v0.20.0 (D073) and was flagged **BETA** on 2026-05-30 per [`decisions.md::D083`](../.qcoda/decisions.md).
+
+| Constraint | Details |
+|---|---|
+| Platform | Apple Silicon M1/M2/M3 only. No Intel Mac, no Linux, no Windows. |
+| Minimum UMA | **64 GB** (D083). `image_registry.min_vram_gb = 16` is the model working-set floor, NOT the host sysreq. |
+| Recommended for production | 128 GB UMA Mac Studio. |
+| Co-resident workloads | **Do not co-run with other large MLX/LLM workloads** (osaurus, mlx-lm.server, large Ollama models, vLLM). M1 Ultra 64 GB kernel-panicked + hard-rebooted under co-resident load 2026-05-30. |
+| Backend | mflux in-process. ComfyUI / A1111 / Draw Things deferred to v2. |
+| Models | FLUX-schnell, FLUX-dev only (D064, D071). SDXL / SD 1.5 not supported by mflux 0.17.5. |
+| Content filter | None shipped. Operator policy applies (D064). |
+| After a panic | Pull `/Library/Logs/DiagnosticReports/*.panic` and file a lessons entry. |
+
+Ref: [`docs/image_gen.md`](image_gen.md), [`decisions.md::D083`](../.qcoda/decisions.md), [`decisions.md::D064`](../.qcoda/decisions.md).
+
+---
+
 ## 2. Anthropic API compatibility (`/v1/messages`)
 
 | Feature | Status | Notes |

@@ -14,6 +14,11 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
+try:
+    AGENT_VERSION = (Path(__file__).resolve().parents[2] / "VERSION").read_text().strip()
+except Exception:
+    AGENT_VERSION = "unknown"
+
 # Line-buffer stdout/stderr so any residual non-logging writes (third-party
 # libs, traceback printers) reach journalctl/docker logs immediately without
 # requiring `PYTHONUNBUFFERED=1`. Agent diagnostics now flow via the
@@ -467,17 +472,28 @@ def _image_capability_probe() -> tuple[bool, list[str], float]:
 
     Returns (image_available, image_models, vram_gb). All best-effort:
     failures (mflux missing, no models installed, non-Apple-Silicon) collapse
-    to (False, [], 0.0) and the agent advertises no image capability."""
+    to (False, [], 0.0) and the agent advertises no image capability.
+
+    Failure reasons logged at WARNING so operators can debug missing
+    image-gen capability without raising the log level (D078)."""
     try:
-        from . import image_driver_mflux as _img_drv  # type: ignore
+        from lib.agent import image_driver_mflux as _img_drv  # type: ignore
         if not _img_drv.mflux_available():
+            logger.warning("image probe: mflux import failed — install with `pip install mflux`")
             return (False, [], 0.0)
         installed = _img_drv.discover_installed_models()
         if not installed:
+            logger.warning(
+                "image probe: mflux OK but no installed models at %s — "
+                "check LLMESH_IMAGE_MODELS_DIR (default ~/.llmesh/models/image), "
+                "filesystem permissions (launchd-spawned agents need TCC access "
+                "for external volumes), and that all registry repo_files are present.",
+                _img_drv._models_dir(),
+            )
             return (False, [], 0.0)
         return (True, installed, _img_drv.estimate_uma_gb())
     except Exception as exc:
-        logger.debug("image capability probe failed: %s", exc)
+        logger.warning("image probe: exception during capability probe: %r", exc)
         return (False, [], 0.0)
 
 
@@ -551,6 +567,7 @@ def gather_resources() -> dict:
         "streaming_capable": True,
         "context_size": context_size,
         "model_context": model_context,
+        "agent_version": AGENT_VERSION,
     }
 
 class AppState:
@@ -603,6 +620,7 @@ async def heartbeat_loop(state: AppState):
     prev_ollama = None
     prev_vllm = None
     prev_mlx = None
+    prev_image = None
 
     while True:
         # Uniform jitter on the 5s heartbeat cadence to avoid thundering-herd
@@ -620,19 +638,20 @@ async def heartbeat_loop(state: AppState):
             vllm_up = check_vllm_available() and not_overloaded
             mlx_up = check_mlx_available() and not_overloaded
 
+            # D064: image_available toggles per heartbeat — mflux import +
+            # installed-model state may change while agent runs.
+            image_up_h, _img_models_h, _vram_h = _image_capability_probe()
+
             # Re-register when any backend transitions back to available — refreshes model lists
             if prev_ollama is not None:
-                if (ollama_up and not prev_ollama) or (vllm_up and not prev_vllm) or (mlx_up and not prev_mlx):
+                if (ollama_up and not prev_ollama) or (vllm_up and not prev_vllm) or (mlx_up and not prev_mlx) or (image_up_h and not prev_image):
                     logger.info("🔄 Backend came back online — refreshing registration...")
                     await register_with_hub(state)
 
             prev_ollama = ollama_up
             prev_vllm = vllm_up
             prev_mlx = mlx_up
-
-            # D064: image_available toggles per heartbeat — mflux import +
-            # installed-model state may change while agent runs.
-            image_up_h, _img_models_h, _vram_h = _image_capability_probe()
+            prev_image = image_up_h
             payload = {
                 "ollama_available": ollama_up,
                 "vllm_available": vllm_up,
@@ -1281,7 +1300,7 @@ async def _run_image_mflux(client: httpx.AsyncClient, state: AppState, task: dic
                 payload.get("steps"))
 
     try:
-        from . import image_driver_mflux as _img_drv
+        from lib.agent import image_driver_mflux as _img_drv
         images_b64 = await _img_drv.run_image_task(payload, model)
         await client.post(
             submit_url,
@@ -1291,10 +1310,10 @@ async def _run_image_mflux(client: httpx.AsyncClient, state: AppState, task: dic
         )
         logger.info("✅ [%s] IMAGE done. count=%s", task_id, len(images_b64))
     except Exception as e:
-        logger.error("❌ [%s] IMAGE failed: %s", task_id, e)
+        logger.exception("❌ [%s] IMAGE failed", task_id)
         await client.post(
             submit_url,
-            json={"output": f"Image generation failed: {e}", "error": True},
+            json={"output": f"Image generation failed: {e!r}", "error": True},
             headers=auth,
         )
 
@@ -1541,8 +1560,26 @@ async def main():
     )
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.getenv("LLMESH_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # D080: split log streams so launchd's StandardOutPath gets normal
+    # operational logs (INFO/DEBUG) and StandardErrorPath gets only WARNING+.
+    # Default logging.basicConfig sends everything to stderr, leaving the
+    # .log file empty and trapping operators who tail it expecting output.
+    _log_level = os.getenv("LLMESH_LOG_LEVEL", "INFO").upper()
+    _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    _stdout_h = logging.StreamHandler(sys.stdout)
+    _stdout_h.setLevel(logging.DEBUG)
+    _stdout_h.addFilter(lambda r: r.levelno < logging.WARNING)
+    _stdout_h.setFormatter(_fmt)
+
+    _stderr_h = logging.StreamHandler(sys.stderr)
+    _stderr_h.setLevel(logging.WARNING)
+    _stderr_h.setFormatter(_fmt)
+
+    _root = logging.getLogger()
+    _root.setLevel(_log_level)
+    _root.handlers.clear()
+    _root.addHandler(_stdout_h)
+    _root.addHandler(_stderr_h)
+
     asyncio.run(main())

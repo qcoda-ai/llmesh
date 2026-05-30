@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmesh"
-version = "0.20.0"
+version = "0.20.1"
 description = "Distributed workload orchestration for AI inference across decentralized compute nodes."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -26,6 +26,7 @@ dependencies = [
     "python-dotenv==1.2.2",
     "python-multipart==0.0.22",
     "uvicorn==0.41.0",
+    "gunicorn==23.0.0",
     "slowapi==0.1.9",
 ]
 

@@ -50,8 +50,10 @@ def test_resolve_size_portrait_landscape():
 
 def test_quality_to_steps():
     # schnell defaults: 4 steps draft. dev benefits from more. v1 ships
-    # a single mapping (draft=4, quality=20) that matches schnell exactly
-    # and is the minimum reasonable for dev.
+    # a single mapping (test=1, draft=4, quality=20) that matches schnell
+    # exactly and is the minimum reasonable for dev. D081 added the test
+    # tier for smoke-testing routing/dashboard without paying full inference.
+    assert image_registry.quality_to_steps("test") == 1
     assert image_registry.quality_to_steps("draft") == 4
     assert image_registry.quality_to_steps("quality") == 20
     assert image_registry.quality_to_steps("nonsense") == 4  # falls back to draft

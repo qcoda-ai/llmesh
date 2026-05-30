@@ -77,82 +77,117 @@
                 <!-- Inference form + API info -->
                 <div class="col-lg-4">
                     <div class="card shadow-sm mb-3">
-                        <div class="card-header bg-dark text-white">Request AI Inference</div>
+                        <div class="card-header bg-transparent border-0 pb-0">
+                            <ul class="nav nav-tabs card-header-tabs" role="tablist">
+                                <li class="nav-item" role="presentation">
+                                    <button class="nav-link active" id="tab-chat-btn" data-bs-toggle="tab"
+                                            data-bs-target="#tab-chat" type="button" role="tab"
+                                            aria-controls="tab-chat" aria-selected="true">Inference</button>
+                                </li>
+                                {% if image_models %}
+                                <li class="nav-item" role="presentation">
+                                    <button class="nav-link" id="tab-image-btn" data-bs-toggle="tab"
+                                            data-bs-target="#tab-image" type="button" role="tab"
+                                            aria-controls="tab-image" aria-selected="false">
+                                        Image
+                                        <span class="badge bg-warning text-dark ms-1" style="font-size: 0.65rem; vertical-align: middle;">BETA</span>
+                                    </button>
+                                </li>
+                                {% endif %}
+                            </ul>
+                        </div>
                         <div class="card-body">
-                            <form action="/dashboard/request_inference" method="post">
-                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                                <div class="mb-3">
-                                    <label for="model" class="form-label">Model</label>
-                                    <select class="form-select form-select-sm" id="model" name="model" required>
-                                        {% if available_models %}
-                                            {% for model in available_models %}
-                                            <option value="{{ model.name }}">{{ model.name }} ({{ model.count }})</option>
-                                            {% endfor %}
-                                        {% else %}
-                                            <option value="" disabled selected>No models available online</option>
-                                        {% endif %}
-                                    </select>
+                            <div class="tab-content">
+                                <div class="tab-pane fade show active" id="tab-chat" role="tabpanel"
+                                     aria-labelledby="tab-chat-btn">
+                                    <form action="/dashboard/request_inference" method="post">
+                                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                        <div class="row g-2 mb-2 align-items-center">
+                                            <label for="model" class="col-3 col-form-label col-form-label-sm">Model</label>
+                                            <div class="col-9">
+                                                <select class="form-select form-select-sm" id="model" name="model" required>
+                                                    {% if available_models %}
+                                                        {% for model in available_models %}
+                                                        <option value="{{ model.name }}">{{ model.name }} ({{ model.count }})</option>
+                                                        {% endfor %}
+                                                    {% else %}
+                                                        <option value="" disabled selected>No models available online</option>
+                                                    {% endif %}
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="row g-2 mb-2">
+                                            <label for="prompt" class="col-3 col-form-label col-form-label-sm">Prompt</label>
+                                            <div class="col-9">
+                                                <textarea class="form-control form-control-sm" id="prompt" name="prompt"
+                                                          rows="2" placeholder="e.g. Translate hello to Spanish" required></textarea>
+                                            </div>
+                                        </div>
+                                        <button type="submit" id="submitBtn" class="btn btn-primary btn-sm w-100"
+                                                {% if not available_models %}disabled{% endif %}>
+                                            Send to Mesh
+                                        </button>
+                                    </form>
                                 </div>
-                                <div class="mb-3">
-                                    <label for="prompt" class="form-label">Prompt</label>
-                                    <textarea class="form-control form-control-sm" id="prompt" name="prompt"
-                                              rows="4" placeholder="e.g. Translate hello to Spanish" required></textarea>
+                                {% if image_models %}
+                                <div class="tab-pane fade" id="tab-image" role="tabpanel"
+                                     aria-labelledby="tab-image-btn">
+                                    <form action="/dashboard/request_image" method="post">
+                                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                        <div class="row g-2 mb-2 align-items-center">
+                                            <label for="img_model" class="col-3 col-form-label col-form-label-sm">Model</label>
+                                            <div class="col-9">
+                                                <select class="form-select form-select-sm" id="img_model" name="model" required>
+                                                    {% for m in image_models %}
+                                                    <option value="{{ m }}">{{ m }}</option>
+                                                    {% endfor %}
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="row g-2 mb-2">
+                                            <label for="img_prompt" class="col-3 col-form-label col-form-label-sm">Prompt</label>
+                                            <div class="col-9">
+                                                <textarea class="form-control form-control-sm" id="img_prompt" name="prompt"
+                                                          rows="2" placeholder="e.g. A red apple on a wooden table, photorealistic"
+                                                          required></textarea>
+                                            </div>
+                                        </div>
+                                        <div class="row g-2 mb-2 align-items-center">
+                                            <label for="img_size" class="col-3 col-form-label col-form-label-sm">Size</label>
+                                            <div class="col-9">
+                                                <select class="form-select form-select-sm" id="img_size" name="size">
+                                                    <option value="square" selected>Square</option>
+                                                    <option value="portrait">Portrait</option>
+                                                    <option value="landscape">Landscape</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="row g-2 mb-2 align-items-center">
+                                            <label for="img_quality" class="col-3 col-form-label col-form-label-sm">Speed</label>
+                                            <div class="col-9">
+                                                <select class="form-select form-select-sm" id="img_quality" name="quality">
+                                                    <option value="test">Test (1 step, ~5s)</option>
+                                                    <option value="draft" selected>Draft (4 steps)</option>
+                                                    <option value="quality">Quality (20 steps)</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <button type="submit" class="btn btn-success btn-sm w-100">
+                                            Generate Image
+                                        </button>
+                                        <div class="alert alert-warning small mt-2 mb-0 py-2 px-2">
+                                            <strong>BETA &mdash; stability advisory.</strong> Apple Silicon Mac, <strong>64 GB UMA minimum</strong>
+                                            (128 GB recommended for production). Quit other large MLX/LLM workloads (osaurus, mlx-lm.server,
+                                            big Ollama models) before generating &mdash; co-resident load has caused a kernel panic + reboot
+                                            on M1 Ultra 64 GB. See <code>docs/image_gen.md</code> and <code>decisions.md::D083</code>.
+                                            No content filter shipped &mdash; operator policy applies.
+                                        </div>
+                                    </form>
                                 </div>
-                                <button type="submit" id="submitBtn" class="btn btn-primary btn-sm w-100"
-                                        {% if not available_models %}disabled{% endif %}>
-                                    Send to Mesh
-                                </button>
-                            </form>
+                                {% endif %}
+                            </div>
                         </div>
                     </div>
-
-                    {% if image_models %}
-                    <div class="card shadow-sm mb-3">
-                        <div class="card-header bg-success text-white">Generate Image (D064)</div>
-                        <div class="card-body">
-                            <form action="/dashboard/request_image" method="post">
-                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                                <div class="mb-3">
-                                    <label for="img_model" class="form-label">Model</label>
-                                    <select class="form-select form-select-sm" id="img_model" name="model" required>
-                                        {% for m in image_models %}
-                                        <option value="{{ m }}">{{ m }}</option>
-                                        {% endfor %}
-                                    </select>
-                                </div>
-                                <div class="mb-3">
-                                    <label for="img_prompt" class="form-label">Prompt</label>
-                                    <textarea class="form-control form-control-sm" id="img_prompt" name="prompt"
-                                              rows="3" placeholder="e.g. A red apple on a wooden table, photorealistic"
-                                              required></textarea>
-                                </div>
-                                <div class="row g-2 mb-3">
-                                    <div class="col-6">
-                                        <label for="img_size" class="form-label small">Size</label>
-                                        <select class="form-select form-select-sm" id="img_size" name="size">
-                                            <option value="square" selected>Square</option>
-                                            <option value="portrait">Portrait</option>
-                                            <option value="landscape">Landscape</option>
-                                        </select>
-                                    </div>
-                                    <div class="col-6">
-                                        <label for="img_quality" class="form-label small">Speed</label>
-                                        <select class="form-select form-select-sm" id="img_quality" name="quality">
-                                            <option value="draft" selected>Draft (fast)</option>
-                                            <option value="quality">Quality (slow)</option>
-                                        </select>
-                                    </div>
-                                </div>
-                                <button type="submit" class="btn btn-success btn-sm w-100">
-                                    Generate Image
-                                </button>
-                                <small class="text-muted d-block mt-2">
-                                    No content filter shipped &mdash; operator policy applies. See <code>docs/image_gen.md</code>.
-                                </small>
-                            </form>
-                        </div>
-                    </div>
-                    {% endif %}
 
                     <div class="card shadow-sm">
                         <div class="card-header bg-info text-white">API Endpoints</div>
@@ -233,6 +268,20 @@
                         <div class="card-header bg-secondary text-white">Response Speed (ms/token)</div>
                         <div class="card-body">
                             <div class="chart-container"><canvas id="chartSpeed"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-secondary text-white">
+                            Time to First Token (ms) &mdash; p50 / p95 by model, last 24h
+                        </div>
+                        <div class="card-body">
+                            <div class="chart-container"><canvas id="chartTTFT"></canvas></div>
+                            <small class="text-muted d-block mt-1">
+                                Hub-side TTFT (D084): includes routing + agent dispatch + backend cold-start.
+                                Streaming paths only. Models with fewer than 20 samples are omitted.
+                            </small>
                         </div>
                     </div>
                 </div>
@@ -466,7 +515,7 @@ function updateNodeTable(nodes) {
     container.innerHTML = nodes.map((n, idx) => {
         const r = nodeRatings[n.node_id_full] || {};
         const stale = n.last_seen_sec >= 30;
-        const anyUp = n.ollama_available || n.vllm_available || n.mlx_available;
+        const anyUp = n.ollama_available || n.vllm_available || n.mlx_available || n.image_available;
         const dotClass = stale ? 'stale' : anyUp ? 'online' : 'offline';
         const collapseId = `node-collapse-${idx}`;
 
@@ -483,6 +532,8 @@ function updateNodeTable(nodes) {
                 <span class="status-dot ${dotClass}"></span>
                 <span class="monospace text-muted" style="min-width:80px;font-size:0.8rem">${esc(n.node_id)}</span>
                 <span class="badge bg-secondary">${esc(n.os_name)}</span>
+                <span class="badge ${n.agent_version === n.hub_version ? 'bg-success-subtle text-success-emphasis' : 'bg-secondary-subtle text-secondary-emphasis'}"
+                      title="agent ${esc(n.agent_version)} vs hub ${esc(n.hub_version)}">v${esc(n.agent_version || '0.1x')}</span>
                 <span class="text-muted small">${Number(n.cpu_cores) || 0}c&nbsp;/&nbsp;${Number(n.ram_gb) || 0}GB</span>
                 <span class="text-muted small">Ctx&nbsp;${(n.context_size / 1024).toFixed(0)}k</span>
                 <span class="text-muted small">CPU&nbsp;${n.cpu_load.toFixed(1)}%</span>
@@ -496,6 +547,7 @@ function updateNodeTable(nodes) {
                     ${backendRow('vLLM',   n.vllm_available,   n.vllm_models)}
                     ${backendRow('MLX',    n.mlx_available,    n.mlx_models)}
                     ${backendRow('Embed',  (n.embedding_models || []).length > 0, n.embedding_models)}
+                    ${backendRow('Image',  n.image_available, n.image_models)}
                     <div class="text-muted mt-2" style="font-size:0.78rem">
                         Slots: <strong>${n.parallel_slots ?? 1}</strong>&nbsp;·&nbsp;
                         Context: <strong>${n.context_size ?? 8192}</strong>
@@ -571,6 +623,29 @@ async function fetchMetrics() {
             labels: s.timeline.map(i => i.date),
             datasets: [{ label: 'Speed (ms/token)', data: s.timeline.map(i => i.speed_per_token),
                          borderColor: 'rgba(255,159,64,1)', fill: false, tension: 0.1 }]
+        });
+
+        // D084: TTFT p50/p95 per model (last 24h). Server omits models with <20 samples.
+        const ttft = s.ttft || { labels: [], p50: [], p95: [], sample_counts: [] };
+        getOrCreate('chartTTFT', 'bar', {
+            labels: ttft.labels,
+            datasets: [
+                { label: 'p50', data: ttft.p50, backgroundColor: 'rgba(75,192,192,0.6)' },
+                { label: 'p95', data: ttft.p95, backgroundColor: 'rgba(255,99,132,0.6)' },
+            ]
+        }, {
+            scales: { y: { beginAtZero: true, title: { display: true, text: 'ms' } } },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        afterBody: (items) => {
+                            const i = items[0].dataIndex;
+                            const n = (ttft.sample_counts || [])[i];
+                            return n != null ? `n=${n}` : '';
+                        }
+                    }
+                }
+            }
         });
 
         getOrCreate('chartStatus', 'bar', {

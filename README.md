@@ -4,6 +4,21 @@ LLMesh is a distributed workload orchestration system that routes AI inference t
 
 ![LLMesh demo](demo.gif)
 
+## What's new in v0.2 (`0.20.0`)
+
+The v0.2 bundle (released 2026-05-29 as internal `0.20.0`) lands two headline features alongside a stack of streaming/durability upgrades. Full per-decision detail in [`CHANGELOG.md`](CHANGELOG.md).
+
+- **MLX real per-token streaming, default ON.** New `_run_streaming_mlx()` in the agent. Verified end-to-end against **osaurus** (Apache 2.0 Swift, primary target) on M1 Ultra; `mlx-lm.server` also works. Set `MLX_STREAMING_ENABLED=false` to revert. See decisions D059 + D060.
+- **Adaptive chunked SSE streaming (`StreamBatcher`).** New since the first release. Three flush triggers (size, time, target PPS) + TPS-driven sliding window that converges to ~8× token aggregation at MLX rates without hurting time-to-first-token. Cuts hub `/stream` syscall pressure under fast clusters by ~80%. Unified across all three backends (Ollama, vLLM, MLX) — no per-backend streaming divergence. `STREAM_BATCH_FIXED=N` escape hatch for load testing / debug / conservative production. Per-batch telemetry surfaced agent → hub → dashboard. See decisions D041 (algorithm), D067 (three-backend unification), D068 (telemetry).
+- **Image generation v1 — BETA.** OpenAI-compatible `POST /v1/images/generations` + dashboard `Image` tab. Backend: **mflux in-process on Apple Silicon Macs** (FLUX-schnell, FLUX-dev). Operator-explicit model install — never auto-downloads weights. **Read the BETA + system-requirement advisory in [`docs/image_gen.md`](docs/image_gen.md) before enabling**: 64 GB UMA minimum, do **not** co-run with other large MLX/LLM workloads (Ollama with a big model loaded, mlx-lm.server, etc.) — co-resident large RSS has triggered a macOS kernel panic on M1 Ultra 64 GB (D083). 128 GB Mac Studio recommended for production. See decisions D064, D071, D073, D083.
+
+Other v0.2 wins: Anthropic Messages SSE streaming on `/v1/messages` (D061), vLLM streaming default ON (D040 + D044), hub state durability for the task queue + node registry (D053 + D058), weighted routing (D054), CSRF on the dashboard (D055), `/v1/limits` + 256 KB `MAX_INPUT_BYTES` (D049). Full list: [`CHANGELOG.md`](CHANGELOG.md).
+
+### Post-v0.20.0 — `0.20.1` (CI/CD + TTFT + image-gen BETA polish)
+
+- **CI/CD via CircleCI auto-deploy** (D085–D091). `git push main` → CircleCI test gate (pytest + ledger validator + gitleaks) → SSH deploy to a bare-metal systemd host → `systemctl restart llmesh` + `/health` gate + optional agent restart. Operator setup walkthrough at [`docs/cicd_setup_circleci.md`](docs/cicd_setup_circleci.md). Comparison vs Bitbucket Pipelines preserved at `.qcoda/strategy/cicd_circleci_vs_bitbucket_pipelines.md`. Gunicorn-supervised uvicorn worker (pinned `-w 1` per single-instance hub constraint), nginx + Let's Encrypt template, optional agent unit (`deploy/meshclient.service`) for hosts that also run a node.
+- **Time-to-first-token (TTFT) tracking + dashboard chart** (D084). New `inference_events.ttft_ms` column populated on both the OpenAI and Anthropic SSE paths. The dashboard Stats tab gains a "Time to First Token (ms) — p50 / p95 by model, last 24h" bar chart so operators can measure how responsive each model on their mesh feels (lower = snappier). Definition is hub-side and includes routing + agent dispatch + backend cold-start — the same wait a real client sees. Models with fewer than 20 samples in the window are omitted from the chart to keep p95 honest. NULL on non-streaming paths (blocking complete, embeddings, image-gen).
+
 ## Core Project Components
 
 Based on our recent implementation phases, the system is designed around two primary components:
@@ -174,15 +189,16 @@ Each agent node registers available models with the Hub. **Ollama is enabled by 
 
 A node can run any combination of these simultaneously. Models from all active backends are pooled and available for routing.
 
-#### Backend support tiers
+#### Backend support tiers (as of v0.20.0)
 
 | Tier | Backend | Notes |
 |---|---|---|
-| **Full** | Ollama | Fully supported. Real token streaming (SSE). Tested end-to-end. Recommended for all deployments. |
-| **Beta** | vLLM | Inference works (blocking; streaming falls back). GPU/Linux. Auth-protected endpoints supported via `VLLM_API_KEY` (D014). Context window auto-detected from `max_model_len` in `/v1/models` (D015). LiteLLM Proxy compatibility via the same backend — see [docs/integrations/litellm.md](docs/integrations/litellm.md). |
-| **Beta** | MLX | Partial support. Inference works; streaming falls back to blocking mode. macOS Apple Silicon only. Less tested. |
+| **Full** | Ollama | Fully supported. Real per-token SSE streaming. Adaptive batching via `StreamBatcher` (D041 + D067). Tested end-to-end. Recommended for all deployments. |
+| **Full** | vLLM | Real per-token SSE streaming, default ON (D040 + D044, verified in LAB-002). GPU/Linux. Auth-protected endpoints via `VLLM_API_KEY` (D014). Context auto-detected from `max_model_len` in `/v1/models` (D015). Forwards client `max_tokens`. LiteLLM Proxy compatibility — see [docs/integrations/litellm.md](docs/integrations/litellm.md). Set `VLLM_STREAMING_ENABLED=false` to revert to the D018 bridge path. |
+| **Full** | MLX | Real per-token SSE streaming, default ON (D059 + D060, verified in LAB-003 against **osaurus** on M1 Ultra). macOS Apple Silicon only. `mlx-lm.server` also compatible. Set `MLX_STREAMING_ENABLED=false` to revert to the D018 bridge path. |
+| **BETA** | mflux (image generation) | OpenAI-compatible `POST /v1/images/generations` + dashboard `Image` tab. FLUX-schnell + FLUX-dev on Apple Silicon Macs **only**. **64 GB UMA minimum, no co-resident large MLX/LLM workloads** (D083). Operator-explicit model install (`scripts/install_image_model.py`). See [`docs/image_gen.md`](docs/image_gen.md) — read the stability advisory before enabling. |
 
-vLLM and MLX support is functional but not streaming-optimised. If you hit issues with these backends, please open an issue. Streaming support for vLLM and MLX is on the roadmap.
+All three inference backends (Ollama, vLLM, MLX) share the same adaptive `StreamBatcher` pipeline (D067) — no per-backend streaming divergence as of v0.20.0.
 
 Configure the agent to authenticate with the Hub using your API key. You can set it up in two ways:
 
@@ -391,7 +407,7 @@ Inference events and node snapshots accumulate indefinitely by default. Pruning 
 
 ## API Endpoints
 
-Once the Hub is running, it exposes three standard LLM API endpoints. Point any compatible SDK at `http://localhost:8000` using your API key from `server_config.json`.
+Once the Hub is running, it exposes four standard LLM API endpoints (chat, embeddings, Anthropic messages, image generation). Point any compatible SDK at `http://localhost:8000` using your API key from `server_config.json`.
 
 ### OpenAI-Compatible (`/v1/chat/completions`)
 
@@ -441,7 +457,7 @@ Bounds (configurable via env): `MAX_INPUT_BYTES=262144` (256 KB; D049), `MAX_BAT
 
 ### Anthropic-Compatible (`/v1/messages`)
 
-Uses `x-api-key: <key>` header — compatible with the Anthropic SDK.
+Uses `x-api-key: <key>` header — compatible with the Anthropic SDK. **SSE streaming via `stream: true`** ships in v0.20.0 (D061) — canonical 7-event sequence verified against the official `anthropic` Python SDK 0.39.0 in LAB-004.
 
 ```bash
 curl -X POST http://localhost:8000/v1/messages \
@@ -463,6 +479,19 @@ response = client.messages.create(
 ```
 
 > **Note**: The model name must match a model available on a connected agent node (via Ollama, vLLM, or MLX). The hub routes to whichever node has the model. Requests return `503` if no capable node is online.
+
+### Image Generation (`/v1/images/generations`) — **BETA**
+
+OpenAI-compatible image generation via the local `mflux` backend on Apple Silicon Macs. Returns base64-encoded PNG. **Read [`docs/image_gen.md`](docs/image_gen.md) before enabling** — v1 ships with a 64 GB UMA minimum and a hard "no co-resident large MLX/LLM workloads" guidance after a confirmed kernel panic on M1 Ultra 64 GB (D083).
+
+```bash
+curl -X POST http://localhost:8000/v1/images/generations \
+     -H "Authorization: Bearer my_secret_key_1" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"flux-schnell","prompt":"a red apple on a wooden table","n":1,"size":"1024x1024"}'
+```
+
+One-time operator setup: `pip install mflux huggingface_hub`, `hf auth login` (free + Apache-2.0 for `flux-schnell`), then `python scripts/install_image_model.py install flux-schnell --yes` to pull the ~32 GB diffusers-layout weights. Restart the agent — the `Image` tab appears on the dashboard once at least one node advertises image capability. See decisions D064 (scope), D071 (install layout), D073 (LAB-005 graduation), D083 (BETA + sysreq tightening).
 
 ## Known Limitations & Security Caveats
 
@@ -488,7 +517,8 @@ LLMesh is an early release. The following behaviors are intentional trade-offs o
 
 ### Backends
 
-- **Ollama is the only fully supported backend.** vLLM and MLX are **beta**: they fall back to blocking inference (no real SSE streaming), and vLLM auto-detects its context window from a non-standard `max_model_len` field that LiteLLM Proxy and some reverse proxies strip. Set `VLLM_API_KEY` for auth-protected vLLM endpoints and `VLLM_HEALTH_PATH=/health/liveliness` when fronting with LiteLLM Proxy.
+- **Ollama, vLLM, and MLX are all production-supported with real per-token streaming as of v0.20.0.** All three share the same adaptive `StreamBatcher` pipeline (D067). vLLM auto-detects its context window from `max_model_len` in `/v1/models` (D015); set `VLLM_MAX_CONTEXT` if LiteLLM Proxy or a reverse proxy strips that field. Set `VLLM_API_KEY` for auth-protected vLLM endpoints and `VLLM_HEALTH_PATH=/health/liveliness` when fronting with LiteLLM Proxy. Set `VLLM_STREAMING_ENABLED=false` or `MLX_STREAMING_ENABLED=false` to revert that backend to the D018 bridge path if needed.
+- **Image generation is BETA, Mac-only, with strict co-residency rules.** mflux in-process; **64 GB UMA minimum** Apple Silicon, **no co-resident large MLX/LLM workloads** (Ollama with a big model loaded, mlx-lm.server, etc.) — co-resident large RSS triggered a kernel panic on M1 Ultra 64 GB (D083). 128 GB Mac Studio recommended for production. See [`docs/image_gen.md`](docs/image_gen.md) and [`docs/known_limitations.md`](docs/known_limitations.md) §1a.
 - **Session memory compression runs in-process on the hub.** This is a deliberate privacy choice: prompts and conversation history never leave the hub for summarization. It also means the hub's memory footprint includes the compression model (~300MB for the default Qwen2.5-0.5B). Set `SESSION_MEMORY_MODE=cutoff` to disable compression entirely.
 
 ### Scale ceilings
@@ -511,6 +541,9 @@ If you hit one of these limitations and it's a blocker for your use case, please
 
 For further details on deployment and architectural plans, refer to the documentation in the `docs/` directory:
 
+- **Changelog**: Full per-release history in [CHANGELOG.md](CHANGELOG.md) and per-decision provenance in [`.qcoda/decisions.md`](.qcoda/decisions.md).
+- **Image Generation (BETA)**: Read [docs/image_gen.md](docs/image_gen.md) before enabling — covers FLUX-schnell/dev install, system requirements (64 GB UMA, no co-resident MLX workloads), and the kernel-panic stability advisory codified in D083.
+- **Known Limitations**: Single-page taxonomy of every documented gap at [docs/known_limitations.md](docs/known_limitations.md).
 - **Session Memory**: Review [docs/memory.md](docs/memory.md) for full session memory configuration, compression modes, and the `X-Session-ID` header protocol.
 - **PostgreSQL Backend**: Review [docs/postgres.md](docs/postgres.md) for configuring a shared Postgres session store for multi-instance deployments.
 - **Token Streaming**: Review [docs/streaming.md](docs/streaming.md) for SSE streaming usage, backend support matrix, and nginx configuration requirements.

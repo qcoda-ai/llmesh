@@ -26,7 +26,8 @@ _DDL = [
         is_compression      INTEGER DEFAULT 0,
         kind                TEXT DEFAULT 'chat',
         stream_batches      INTEGER DEFAULT 0,
-        stream_final_size   INTEGER DEFAULT 0
+        stream_final_size   INTEGER DEFAULT 0,
+        ttft_ms             REAL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_inf_user_ts ON inference_events(user_id, timestamp)",
     """CREATE TABLE IF NOT EXISTS node_snapshots (
@@ -75,6 +76,10 @@ _MIGRATIONS = [
     # already exists from a prior run.
     "ALTER TABLE inference_events ADD COLUMN stream_batches INTEGER DEFAULT 0",
     "ALTER TABLE inference_events ADD COLUMN stream_final_size INTEGER DEFAULT 0",
+    # D084: hub-side time-to-first-token (ms). NULL for non-streaming paths
+    # (blocking complete, embeddings, image-gen). Captured at first non-sentinel
+    # chunk in `_real_sse_generator` / `_real_sse_generator_anthropic`.
+    "ALTER TABLE inference_events ADD COLUMN ttft_ms REAL",
 ]
 
 
@@ -252,7 +257,8 @@ async def _flush_buffer() -> None:
          e.get("duration_ms"), e.get("tokens_prompt", 0), e.get("tokens_completion", 0),
          1 if e.get("is_compression") else 0,
          e.get("kind", "chat"),
-         e.get("stream_batches", 0), e.get("stream_final_size", 0))
+         e.get("stream_batches", 0), e.get("stream_final_size", 0),
+         e.get("ttft_ms"))
         for e in events if e.get("event") == "inference"
     ]
     snap_rows = [
@@ -272,8 +278,8 @@ async def _flush_buffer() -> None:
                 "INSERT INTO inference_events "
                 "(timestamp, user_id, node_id, model, status, duration_ms, "
                 " tokens_prompt, tokens_completion, is_compression, kind, "
-                " stream_batches, stream_final_size) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " stream_batches, stream_final_size, ttft_ms) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 inf_rows
             )
         if snap_rows:
@@ -298,7 +304,8 @@ async def _flush_buffer() -> None:
 def log_inference_event(user_id: str, node_id: str, model: str, status: str,
                         duration_ms: float, tokens_prompt: int, tokens_completion: int,
                         is_compression: bool = False, kind: str = "chat",
-                        stream_batches: int = 0, stream_final_size: int = 0) -> None:
+                        stream_batches: int = 0, stream_final_size: int = 0,
+                        ttft_ms: float | None = None) -> None:
     """Queue an inference event for the next batch flush. Sync-by-design:
     one list.append, no await, no coroutine spawning. Safe to call from any
     context; the flush task picks it up on the next tick.
@@ -307,7 +314,10 @@ def log_inference_event(user_id: str, node_id: str, model: str, status: str,
     `stream_batches` + `stream_final_size` (D068) capture the agent's
     `StreamBatcher` telemetry on streaming tasks; zero on non-streamed
     inference. Lets operators see batcher convergence in the dashboard task
-    viewer without grepping agent logs."""
+    viewer without grepping agent logs.
+    `ttft_ms` (D084) is hub-side time-to-first-token = ms between task creation
+    and the first non-sentinel chunk on the SSE stream. NULL on non-streaming
+    paths."""
     _event_buffer.append({
         "event": "inference",
         "timestamp": time.time(),
@@ -322,6 +332,7 @@ def log_inference_event(user_id: str, node_id: str, model: str, status: str,
         "kind": kind,
         "stream_batches": stream_batches,
         "stream_final_size": stream_final_size,
+        "ttft_ms": ttft_ms,
     })
 
 
@@ -381,6 +392,37 @@ def _pivot(rows: list, missing=None) -> dict:
         for nid in nodes
     ]
     return {"labels": labels, "datasets": datasets}
+
+
+def _ttft_percentiles(per_model: dict[str, list[float]],
+                      min_samples: int = 20) -> dict:
+    """D084: compute p50/p95 ttft_ms per model. Models with fewer than
+    `min_samples` events are omitted (p95 too noisy with small N).
+
+    Returns `{"labels": [model], "p50": [...], "p95": [...], "sample_counts": [...]}`
+    sorted by p50 ascending so the fastest model is the leftmost bar."""
+    import statistics
+    rows = []
+    for model, samples in per_model.items():
+        if len(samples) < min_samples:
+            continue
+        # statistics.quantiles requires n >= 2. With only 1 sample, p50 = p95 =
+        # that sample. Used by smoke-test setups with TTFT_MIN_SAMPLES=1.
+        if len(samples) == 1:
+            p50 = round(samples[0], 1)
+            p95 = round(samples[0], 1)
+        else:
+            cuts = statistics.quantiles(samples, n=20)
+            p50 = round(cuts[9], 1)
+            p95 = round(cuts[18], 1)
+        rows.append((model, p50, p95, len(samples)))
+    rows.sort(key=lambda r: r[1])
+    return {
+        "labels":        [r[0] for r in rows],
+        "p50":           [r[1] for r in rows],
+        "p95":           [r[2] for r in rows],
+        "sample_counts": [r[3] for r in rows],
+    }
 
 
 async def _get_node_perf_charts(owner_id: str, cutoff: float, node_ratings: dict) -> dict:
@@ -562,6 +604,22 @@ async def get_dashboard_stats(owner_id: str, days: int = 7) -> dict:
     node_ratings = await get_node_ratings(owner_id)
     node_perf = await _get_node_perf_charts(owner_id, cutoff, node_ratings)
 
+    # --- TTFT per model (D084): p50/p95 last 24h, streaming paths only ---
+    ttft_cutoff = now - 24 * 3600
+    ttft_per_model: dict[str, list[float]] = {}
+    async with db.execute("""
+        SELECT model, ttft_ms FROM inference_events
+        WHERE user_id = ? AND timestamp >= ?
+          AND ttft_ms IS NOT NULL AND is_compression = 0
+    """, (owner_id, ttft_cutoff)) as cur:
+        async for row in cur:
+            ttft_per_model.setdefault(row[0], []).append(row[1])
+    # Min-sample floor is operator-tunable so smoke tests + low-traffic dev
+    # installs can see the chart populate. Production default = 20 (p95 noisy
+    # below that). Set TTFT_MIN_SAMPLES=1 locally to render every model.
+    ttft_min = int(os.getenv("TTFT_MIN_SAMPLES", "20"))
+    ttft_chart = _ttft_percentiles(ttft_per_model, min_samples=ttft_min)
+
     result = {
         "timeline": timeline,
         "models": models,
@@ -571,6 +629,7 @@ async def get_dashboard_stats(owner_id: str, days: int = 7) -> dict:
         "sessions_timeline": sessions_timeline,
         "node_ratings": node_ratings,
         "node_perf": node_perf,
+        "ttft": ttft_chart,
     }
 
     # LRU insert with cap

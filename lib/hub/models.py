@@ -34,6 +34,12 @@ class ResourceCaps(BaseModel):
     image_available: bool = False
     image_models: list[str] = []
     vram_gb: float = 0.0
+    # D076: agent code version read from /VERSION at agent process import.
+    # Pre-D076 agents send no field → default "0.1x" (D077 tune from "unknown"):
+    # the absence of the field implies the 0.1x series, which is the version
+    # range that lacks D076's agent_version reporting. The dashboard adds the
+    # "v" prefix; storage stays bare. Operators see "v0.1x" warning badge.
+    agent_version: str = "0.1x"
 
 class RegistrationRequest(BaseModel):
     api_key: str
@@ -96,9 +102,10 @@ class ImageGenerationRequest(BaseModel):
     n: int = 1
     seed: int | None = None
     # Maps to step count at the agent driver:
-    #   draft   → ~20 steps (default — fast iteration)
-    #   quality → ~40 steps (operator opt-in for final renders)
-    quality: Literal["draft", "quality"] = "draft"
+    #   test    → 1 step (D081 — smoke-test tier, ~5s on M1 Ultra)
+    #   draft   → 4 steps (default — fast iteration on schnell)
+    #   quality → 20 steps (operator opt-in for final renders)
+    quality: Literal["test", "draft", "quality"] = "draft"
     # b64_json only in v1; URL response mode deferred to v2.
     response_format: Literal["b64_json"] = "b64_json"
 

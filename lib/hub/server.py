@@ -647,6 +647,15 @@ async def _real_sse_generator_anthropic(
             if chunk is None:  # sentinel — streaming complete
                 break
 
+            # D084: capture hub-side TTFT on the first content chunk. See
+            # `_real_sse_generator` for the recovered-task guard rationale.
+            if getattr(task, "ttft_ms", None) is None:
+                _created_at = getattr(task, "created_at", None)
+                if _created_at is not None:
+                    ttft = (time.time() - _created_at) * 1000.0
+                    if ttft <= STREAM_CHUNK_TIMEOUT * 1000.0:
+                        task.ttft_ms = ttft
+
             accumulated.append(chunk)
             yield _sse_event("content_block_delta", {
                 "type": "content_block_delta",
@@ -717,6 +726,16 @@ async def _real_sse_generator(
 
             if chunk is None:  # sentinel — streaming complete
                 break
+
+            # D084: capture hub-side TTFT on the first content chunk. Skip if
+            # the gap exceeds STREAM_CHUNK_TIMEOUT — that signature means a
+            # persisted-task recovery (D053), not a fresh first-token wait.
+            if getattr(task, "ttft_ms", None) is None:
+                _created_at = getattr(task, "created_at", None)
+                if _created_at is not None:
+                    ttft = (time.time() - _created_at) * 1000.0
+                    if ttft <= STREAM_CHUNK_TIMEOUT * 1000.0:
+                        task.ttft_ms = ttft
 
             accumulated.append(chunk)
             yield _chunk({"content": chunk})
@@ -1119,6 +1138,19 @@ async def stream_task_chunk(
         await task_store.get_task_store().save_result(
             task_id, None, body.prompt_tokens, body.completion_tokens, status="completed",
         )
+        # D084: emit the inference event from the streaming-done path. Prior
+        # to D084 the `/complete` endpoint was the only metric emit site, so
+        # streamed chat tasks left NO row in `inference_events` — silently
+        # dropping D068 batcher telemetry and (the D084 ask) TTFT. Build the
+        # synthetic `result` dict that `_emit_inference_event` expects from
+        # the fields the agent reported on the done frame.
+        duration_ms = (time.time() - task.start_time) * 1000.0
+        _emit_inference_event(
+            task, node_id, duration_ms,
+            {"prompt_tokens": body.prompt_tokens,
+             "completion_tokens": body.completion_tokens},
+            status="success",
+        )
     else:
         _put_or_drop_oldest(body.chunk)
 
@@ -1230,6 +1262,9 @@ def _emit_inference_event(task: tasks.Task, node_id: str, duration_ms: float,
         # Zero on non-streamed tasks; populated on streamed ones.
         stream_batches=getattr(task, "stream_batches", 0),
         stream_final_size=getattr(task, "stream_final_size", 0),
+        # D084: hub-side time-to-first-token, set by the SSE generators on the
+        # first content chunk. None on non-streamed tasks.
+        ttft_ms=getattr(task, "ttft_ms", None),
     )
 
 
@@ -1302,6 +1337,10 @@ async def get_nodes_for_owner(
             "vllm_models": getattr(n.resources, "vllm_models", []),
             "mlx_available": getattr(n.resources, "mlx_available", False),
             "mlx_models": getattr(n.resources, "mlx_models", []),
+            "image_available": getattr(n.resources, "image_available", False),
+            "image_models": getattr(n.resources, "image_models", []),
+            "agent_version": getattr(n.resources, "agent_version", "0.1x"),
+            "hub_version": APP_VERSION,
             "model_context": getattr(n.resources, "model_context", {}),
             "parallel_slots": getattr(n.resources, "parallel_slots", 1),
             "last_seen_sec": round(current_time - n.last_seen, 1)
@@ -1569,10 +1608,19 @@ async def openai_chat_completions(
     req: OpenAIRequest,
     response: Response,
     authorization: str | None = Header(None),
-    x_session_id: str | None = Header(None)
+    x_session_id: str | None = Header(None),
+    x_qcoda_execution_id: str | None = Header(None),
 ):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Authorization header")
+
+    # QCoda LAB-006 cross-stack correlation hook. QCoda injects this header
+    # via lib/agents/base.py::_call_llm (QCoda D-084 / nodemesh-side log
+    # surface for joint qcoda + llmesh + ollama lab rig). Logged at INFO so
+    # `grep <exec_id> logs/*.log` aligns QCoda's per-agent traces with the
+    # hub-side dispatch line. None when caller is not QCoda.
+    if x_qcoda_execution_id:
+        logger.info("QCoda execution_id=%s model=%s stream=%s", x_qcoda_execution_id, req.model, req.stream)
 
     api_key = authorization.replace("Bearer ", "")
 
@@ -1920,7 +1968,7 @@ async def login_view(request: Request):
     existing = request.cookies.get(CSRF_COOKIE_NAME)
     csrf = existing or secrets.token_urlsafe(32)
     response = templates.TemplateResponse(
-        "login.html", {"request": request, "error": None, "csrf_token": csrf}
+        request, "login.html", {"error": None, "csrf_token": csrf}
     )
     if not existing:
         response.set_cookie(
@@ -1942,8 +1990,8 @@ async def login_submit(
     if not owner_id:
         # Re-render login with the same csrf token so the user can retry.
         return templates.TemplateResponse(
-            "login.html",
-            {"request": request, "error": "Invalid API Key", "csrf_token": csrf_token},
+            request, "login.html",
+            {"error": "Invalid API Key", "csrf_token": csrf_token},
         )
 
     # Mint an opaque session token bound to the owner. Never expose the
@@ -2016,9 +2064,8 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
     csrf = existing_csrf or secrets.token_urlsafe(32)
 
     response = templates.TemplateResponse(
-        "dashboard.html",
+        request, "dashboard.html",
         {
-            "request": request,
             "nodes": owner_nodes,
             "owner_id": owner_id,
             "current_time": time.time(),
@@ -2074,9 +2121,11 @@ async def dashboard_submit_image(
     llmesh_session: str | None = Cookie(None),
     llmesh_csrf: str | None = Cookie(None),
 ):
-    """D064: dashboard image-gen submit. Synchronous — waits for the agent to
-    return base64 PNG and renders it inline in a result page. SOHO operator
-    UX: one form, one result. No SSE / polling / history persistence in v1.
+    """D082: dashboard image-gen submit. Queues the task and redirects to a
+    status view that polls the result endpoint — never blocks the browser.
+    Prior D064-era behaviour blocked the request thread for the full inference
+    duration (up to IMAGE_TASK_TIMEOUT_S), so the page hung with no progress
+    indicator. Now the same pattern as chat: submit → redirect → poll → render.
     """
     _require_csrf(csrf_token, llmesh_csrf)
     owner_id = _resolve_session(llmesh_session)
@@ -2084,7 +2133,6 @@ async def dashboard_submit_image(
         return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
 
     try:
-        # Validate size at this layer too — Form() doesn't enforce Literal.
         req = ImageGenerationRequest(
             model=model, prompt=prompt, size=size, quality=quality, n=1,
         )
@@ -2103,53 +2151,90 @@ async def dashboard_submit_image(
             status_code=e.status_code,
         )
 
-    queued_task = tasks.get_task_status(task_response.node_assigned, task_response.task_id)
-    if queued_task is None:
-        return HTMLResponse("Task not found after queuing", status_code=500)
-    try:
-        await asyncio.wait_for(queued_task.done_event.wait(), timeout=IMAGE_TASK_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        return HTMLResponse(
-            f"<h3>Image generation timed out after {IMAGE_TASK_TIMEOUT_S:.0f}s</h3>"
-            f"<a href='/dashboard'>Back</a>",
-            status_code=504,
-        )
+    return RedirectResponse(
+        url=f"/dashboard/image/{task_response.node_assigned}/{task_response.task_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
-    if queued_task.status != "completed":
-        return HTMLResponse(
-            f"<h3>Backend error: {queued_task.result}</h3><a href='/dashboard'>Back</a>",
-            status_code=502,
-        )
 
-    images = queued_task.result or []
-    metrics.log_image_event(
-        owner_id=owner_id,
-        node_id=task_response.node_assigned,
-        model=req.model,
-        status="success",
-        duration_ms=int((time.time() - queued_task.start_time) * 1000),
-        image_count=len(images),
-        size=queued_task.payload.get("size", ""),
-        steps=int(queued_task.payload.get("steps", 0) or 0),
-        quality_tier=queued_task.payload.get("quality", "draft"),
+@app.get("/dashboard/image/{node_id}/{task_id}", response_class=HTMLResponse)
+async def dashboard_image_status_view(
+    request: Request, node_id: str, task_id: str,
+    llmesh_session: str | None = Cookie(None),
+):
+    """D082: image-gen status view. Renders prompt + model + live elapsed
+    timer + spinner; JS polls /dashboard/image/<node>/<task>/result every
+    1s until it returns the b64 PNG (or an error)."""
+    owner_id = _resolve_session(llmesh_session)
+    if not owner_id:
+        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    task = tasks.get_task_status(node_id, task_id)
+    if not task:
+        return HTMLResponse("Task not found", status_code=404)
+    if task.owner_id != owner_id:
+        return HTMLResponse("Access denied", status_code=403)
+    return templates.TemplateResponse(
+        request, "image_status.html",
+        {
+            "task_id": task_id, "node_id": node_id,
+            "model": task.model,
+            "prompt": (task.payload or {}).get("prompt", ""),
+            "size": (task.payload or {}).get("size", ""),
+            "quality": (task.payload or {}).get("quality", "draft"),
+            "timeout_s": int(IMAGE_TASK_TIMEOUT_S),
+        },
     )
-    # Render inline. Each base64 PNG → an <img> tag with download link.
-    image_blocks = "".join(
-        f'<div class="mb-3"><img src="data:image/png;base64,{b64}" class="img-fluid border rounded" '
-        f'alt="Generated image" /><a class="btn btn-sm btn-outline-secondary mt-2" '
-        f'download="llmesh-{req.model}.png" href="data:image/png;base64,{b64}">Download PNG</a></div>'
-        for b64 in images
-    )
-    return HTMLResponse(
-        f"""<!doctype html><html><head><title>Image generated — LLMesh</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head><body class="bg-light"><div class="container py-4">
-<h3>Image generated</h3>
-<p class="text-muted small">Model: <code>{req.model}</code> &middot; Size: <code>{queued_task.payload.get('size')}</code> &middot; Quality: <code>{req.quality}</code></p>
-{image_blocks}
-<a href="/dashboard" class="btn btn-primary mt-3">Back to dashboard</a>
-</div></body></html>"""
-    )
+
+
+@app.get("/dashboard/image/{node_id}/{task_id}/result")
+async def dashboard_image_result(
+    node_id: str, task_id: str,
+    llmesh_session: str | None = Cookie(None),
+):
+    """D082: poll target for the image status view. Returns one of:
+      {"status": "pending", "elapsed_ms": N}
+      {"status": "done", "images": ["<b64>"], "elapsed_ms": N}
+      {"status": "failed", "error": "...", "elapsed_ms": N}
+    Logs the image event exactly once on the first poll that observes
+    completion (idempotent via a flag on the task object)."""
+    owner_id = _resolve_session(llmesh_session)
+    if not owner_id:
+        return JSONResponse({"status": "failed", "error": "unauthorized"}, status_code=401)
+    task = tasks.get_task_status(node_id, task_id)
+    if not task:
+        return JSONResponse({"status": "failed", "error": "task not found"}, status_code=404)
+    if task.owner_id != owner_id:
+        return JSONResponse({"status": "failed", "error": "access denied"}, status_code=403)
+
+    elapsed_ms = int((time.time() - task.start_time) * 1000)
+
+    if task.status not in ("completed", "failed"):
+        return JSONResponse({"status": "pending", "elapsed_ms": elapsed_ms})
+
+    # One-shot metrics log on first observation of terminal state.
+    if not getattr(task, "_image_event_logged", False):
+        try:
+            metrics.log_image_event(
+                owner_id=owner_id,
+                node_id=node_id,
+                model=task.model,
+                status="success" if task.status == "completed" else "failed",
+                duration_ms=elapsed_ms,
+                image_count=len(task.result) if isinstance(task.result, list) else 0,
+                size=(task.payload or {}).get("size", ""),
+                steps=int((task.payload or {}).get("steps", 0) or 0),
+                quality_tier=(task.payload or {}).get("quality", "draft"),
+            )
+        except Exception as exc:
+            logger.warning("image event log failed for task %s: %r", task_id, exc)
+        task._image_event_logged = True
+
+    if task.status == "failed":
+        err = task.result if isinstance(task.result, str) else "unknown error"
+        return JSONResponse({"status": "failed", "error": err, "elapsed_ms": elapsed_ms})
+
+    images = task.result if isinstance(task.result, list) else []
+    return JSONResponse({"status": "done", "images": images, "elapsed_ms": elapsed_ms})
 
 
 @app.get("/dashboard/task/{node_id}/{task_id}", response_class=HTMLResponse)
@@ -2164,8 +2249,8 @@ async def dashboard_task_status_view(request: Request, node_id: str, task_id: st
         return HTMLResponse("Access denied", status_code=403)
 
     return templates.TemplateResponse(
-        "task_status.html",
-        {"request": request, "task_id": task_id, "node_id": node_id, "task": task, "owner_id": owner_id}
+        request, "task_status.html",
+        {"task_id": task_id, "node_id": node_id, "task": task, "owner_id": owner_id}
     )
 
 

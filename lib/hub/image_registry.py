@@ -90,11 +90,20 @@ def quality_to_steps(quality: str) -> int:
     FLUX-schnell is a distilled model that produces good output in 4 steps;
     adding more does not improve quality. FLUX-dev benefits from 20-50 steps.
     Because we cannot vary the step count by model from the hub side without
-    extra request shape, v1 ships a single mapping (draft=4, quality=20)
+    extra request shape, v1 ships a single mapping (test=1, draft=4, quality=20)
     that matches schnell defaults exactly and is the minimum reasonable for
     dev. The agent driver may override per-model if needed.
+
+    `test` (D081) is a 1-step tier for smoke-testing the routing/dashboard
+    path without paying full inference cost — schnell at 1 step renders in
+    ~5s on an M1 Ultra vs ~40s at 4 steps. Output quality is poor but the
+    contract (200, valid PNG, expected size) is the same.
 
     Future: per-model `default_steps` field on the registry entry, used to
     map quality tier → steps differently per model.
     """
-    return 20 if quality == "quality" else 4
+    if quality == "test":
+        return 1
+    if quality == "quality":
+        return 20
+    return 4

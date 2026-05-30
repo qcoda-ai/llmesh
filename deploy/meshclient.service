@@ -1,0 +1,38 @@
+[Unit]
+Description=LLMesh agent (node client)
+After=network-online.target llmesh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmesh
+Group=llmesh
+WorkingDirectory=/opt/llmesh/app
+
+# Agent env (gitignored, operator-owned). Distinct from /opt/llmesh/app/.env
+# which is the HUB env — agent needs LLMESH_API_KEY (a real auth key the hub
+# trusts), HUB_URL, LLMESH_NODE_ID, and the backend host vars (VLLM_HOST,
+# MLX_HOST, OLLAMA_*). Hub needs none of those. Operator builds .env.agent
+# from .env.agent.example after first deploy. See decisions.md::D091.
+EnvironmentFile=/opt/llmesh/app/.env.agent
+
+Environment="PATH=/opt/llmesh/app/.venv/bin:/usr/bin:/usr/local/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/opt/llmesh/app/.venv/bin/python -m lib.agent.client
+ExecReload=/bin/kill -HUP ${MAINPID}
+Restart=on-failure
+RestartSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/llmesh/app
+
+[Install]
+WantedBy=multi-user.target
