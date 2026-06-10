@@ -865,6 +865,18 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/version")
+async def version_endpoint():
+    # D097: separate unauthenticated `/version` for post-deploy verification.
+    # /health stays version-less (CVE targeting concern, see comment above);
+    # operators who want to verify a CI deploy landed need a deterministic
+    # signal without an API key. Tradeoff accepted: the LLMesh codebase is
+    # public OSS so version-string enumeration adds no surface beyond what
+    # `pip index versions llmesh` already exposes. Mirrors `/health`'s minimal
+    # JSON shape.
+    return {"version": APP_VERSION}
+
+
 @app.post("/register", response_model=RegistrationResponse)
 @limiter.limit(RATE_LIMIT_REGISTER)
 async def register_node(request: Request, reg: RegistrationRequest):

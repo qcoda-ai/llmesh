@@ -8,7 +8,14 @@ Per-change provenance lives in [`.qcoda/decisions.md`](.qcoda/decisions.md) — 
 
 ## [Unreleased]
 
-Targeted for the next patch on top of v0.21.0. Tag pending.
+Targeted for the next patch on top of v0.21.1. Tag pending.
+
+---
+
+## [0.21.1] — 2026-06-10 — Unauthenticated `/version` endpoint
+
+### Added
+- **`GET /version` (unauthenticated, D097).** Returns `{"version": "<APP_VERSION>"}` for post-deploy verification. `/health` stays version-less per the existing CVE-targeting comment; the tradeoff is documented inline on the new route. LLMesh is public OSS — version-string enumeration adds no surface beyond what `pip index versions llmesh` or GitHub Releases already expose. Use case: `curl -s https://mesh.qcoda.com/version` to confirm CI deployed the new code without needing an API key.
 
 ---
 
