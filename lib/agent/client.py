@@ -685,6 +685,36 @@ async def heartbeat_loop(state: AppState):
             state.node_id = None
             state.node_token = None
 
+def _normalize_tool_call_args_for_ollama(messages: list) -> list:
+    """D-009 Phase 2 — coerce assistant-turn tool_calls[].function.arguments
+    from JSON-string (OpenAI wire shape sent by callers) to dict (Ollama 0.30.7
+    requirement for multi-turn). Non-destructive: returns a new list of dicts
+    so we don't mutate caller state."""
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        tcs = m.get("tool_calls")
+        if not tcs:
+            out.append(m)
+            continue
+        new_tcs = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                new_tcs.append(tc); continue
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            new_tcs.append({**tc, "function": {**fn, "arguments": args}})
+        out.append({**m, "tool_calls": new_tcs})
+    return out
+
+
 async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task: dict):
     """Stream Ollama inference token-by-token, batching POSTs to the hub via
     `StreamBatcher` (D041, refactor per D067).
@@ -718,25 +748,38 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
     req_num_ctx = task.get("num_ctx") or OLLAMA_NUM_CTX
     payload = {"model": model, "stream": True, "options": {"num_ctx": req_num_ctx}}
     if messages:
+        # D-009 Phase 2 — same un-coerce as non-stream path.
+        messages = _normalize_tool_call_args_for_ollama(messages)
         payload["messages"] = messages
     else:
         payload["prompt"] = task.get("prompt", "")
+    # D-009 Phase 2 — forward tools to Ollama streaming /api/chat.
+    if task.get("tools"):
+        payload["tools"] = task["tools"]
 
     logger.info("⚙️  [%s] STREAMING via ollama (%s)...", task_id, model)
 
     cancelled = False
     pt = ct = 0
     delta_count = 0
+    captured_tool_calls: list = []
+    captured_thinking_parts: list[str] = []
 
     async def _post_chunk(chunk_text: str, *, done: bool,
                           prompt_tokens: int = 0, completion_tokens: int = 0,
-                          stream_batches: int = 0, stream_final_size: int = 0):
+                          stream_batches: int = 0, stream_final_size: int = 0,
+                          tool_calls: list | None = None,
+                          reasoning_content: str | None = None):
         nonlocal cancelled
         body = {
             "chunk": chunk_text, "done": done,
             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "stream_batches": stream_batches, "stream_final_size": stream_final_size,
         }
+        if tool_calls:
+            body["tool_calls"] = tool_calls
+        if reasoning_content:
+            body["reasoning_content"] = reasoning_content
         resp = await client.post(hub_stream_url, headers=auth, json=body)
         if resp.status_code == 410:
             cancelled = True
@@ -753,6 +796,8 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
             completion_tokens=meta.get("completion_tokens", 0),
             stream_batches=meta.get("stream_batches", 0),
             stream_final_size=meta.get("stream_final_size", 0),
+            tool_calls=meta.get("tool_calls"),
+            reasoning_content=meta.get("reasoning_content"),
         )
 
     cfg = resolve_batcher_config()
@@ -781,9 +826,31 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
                 if data.get("done"):
                     pt = data.get("prompt_eval_count", 0) or 0
                     ct = data.get("eval_count", 0) or 0
+                    # D-009/D-010 Phase 2 — tool_calls + thinking may also
+                    # land on the done frame (Phase 0 verified: streaming tool
+                    # call arrives in a single non-done frame, but defensively
+                    # check both — some Ollama versions may differ).
+                    if messages:
+                        done_msg = data.get("message") or {}
+                        if done_msg.get("tool_calls") and not captured_tool_calls:
+                            captured_tool_calls.extend(done_msg["tool_calls"])
+                        if done_msg.get("thinking"):
+                            captured_thinking_parts.append(done_msg["thinking"])
                     break
 
-                token = data.get("message", {}).get("content", "") if messages else data.get("response", "")
+                if messages:
+                    msg_obj = data.get("message") or {}
+                    token = msg_obj.get("content", "")
+                    # D-009 Phase 2 — capture tool_calls on whichever frame
+                    # Ollama emits them (Phase 0 verified: single frame, content="").
+                    if msg_obj.get("tool_calls") and not captured_tool_calls:
+                        captured_tool_calls.extend(msg_obj["tool_calls"])
+                    # D-010 Phase 2/3 — gpt-oss harmony `thinking` may arrive
+                    # incrementally; accumulate parts and concat at flush.
+                    if msg_obj.get("thinking"):
+                        captured_thinking_parts.append(msg_obj["thinking"])
+                else:
+                    token = data.get("response", "")
                 if not token:
                     continue
                 delta_count += 1
@@ -798,9 +865,16 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
         # post-flush total. `current_size` is the about-to-be-flushed buffer.
         _stream_batches_total = batcher.stats['flushes'] + 1
         _stream_final_size = batcher.current_size
-        await batcher.flush(done=True, prompt_tokens=pt, completion_tokens=ct,
-                            stream_batches=_stream_batches_total,
-                            stream_final_size=_stream_final_size)
+        flush_meta: dict = dict(
+            prompt_tokens=pt, completion_tokens=ct,
+            stream_batches=_stream_batches_total,
+            stream_final_size=_stream_final_size,
+        )
+        if captured_tool_calls:
+            flush_meta["tool_calls"] = captured_tool_calls
+        if captured_thinking_parts:
+            flush_meta["reasoning_content"] = "".join(captured_thinking_parts)
+        await batcher.flush(done=True, **flush_meta)
         logger.info(
             "✅ [%s] Ollama stream complete. P:%s C:%s batches=%s final_size=%s",
             task_id, pt, ct, batcher.stats['flushes'], batcher.current_size,
@@ -1381,6 +1455,8 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
     output_text = ""
     p_tokens = c_tokens = 0
     is_error = False
+    tool_calls: list = []
+    reasoning_content = ""
 
     try:
         if backend in ("vllm", "mlx"):
@@ -1413,20 +1489,39 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
                 logger.error("❌ [%s] %s", task_id, output_text)
         elif messages:
             logger.info("⚙️  [%s] CHAT via ollama (%s)...", task_id, model_to_use)
-            ollama_resp = await client.post("http://localhost:11434/api/chat", json={
+            # D-009 Phase 2 — Ollama 0.30.7 requires assistant-turn
+            # tool_calls[].function.arguments as a DICT, not a JSON-string.
+            # OpenAI wire shape uses string. Un-coerce here before forwarding
+            # so multi-turn tool flows round-trip cleanly. Verified by Phase 0
+            # follow-up probe: string args produce empty assistant content; dict
+            # args produce the expected natural-language answer.
+            messages = _normalize_tool_call_args_for_ollama(messages)
+            ollama_body = {
                 "model": model_to_use,
                 "messages": messages,
                 "stream": False,
                 "options": {"num_ctx": task.get("num_ctx") or OLLAMA_NUM_CTX},
-            })
+            }
+            # D-009 Phase 2 — forward tools to Ollama /api/chat. Ollama returns
+            # plain message.content (no tool_calls field) when the model is not
+            # tool-trained; hub treats absent tool_calls as "no call emitted"
+            # without an allowlist gate.
+            if task.get("tools"):
+                ollama_body["tools"] = task["tools"]
+            ollama_resp = await client.post("http://localhost:11434/api/chat", json=ollama_body)
             if ollama_resp.status_code == 200:
                 o_data = ollama_resp.json()
+                msg = o_data.get("message") or {}
                 # Defensive: backend may return null content; coerce to ""
                 # so the hub's stored result is a real string (D025 sibling).
-                output_text = (o_data.get("message", {}) or {}).get("content") or ""
+                output_text = msg.get("content") or ""
+                tool_calls = msg.get("tool_calls") or []
+                # D-010 Phase 3 — gpt-oss harmony `analysis` channel arrives
+                # in message.thinking on Ollama 0.30.7 (Phase 0 verified).
+                reasoning_content = msg.get("thinking") or ""
                 p_tokens = o_data.get("prompt_eval_count", 0) or 0
                 c_tokens = o_data.get("eval_count", 0) or 0
-                logger.info("✅ [%s] Done. Tokens P:%s C:%s", task_id, p_tokens, c_tokens)
+                logger.info("✅ [%s] Done. Tokens P:%s C:%s tool_calls=%d", task_id, p_tokens, c_tokens, len(tool_calls))
             else:
                 output_text = f"Error from ollama chat: {ollama_resp.status_code} - {ollama_resp.text}"
                 is_error = True
@@ -1460,6 +1555,10 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
         logger.error("❌ [%s] %s", task_id, output_text)
 
     result_payload = {"output": output_text, "prompt_tokens": p_tokens, "completion_tokens": c_tokens}
+    if tool_calls:
+        result_payload["tool_calls"] = tool_calls
+    if reasoning_content:
+        result_payload["reasoning_content"] = reasoning_content
     if is_error:
         result_payload["error"] = True
     submit_resp = await client.post(

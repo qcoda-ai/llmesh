@@ -87,6 +87,12 @@ class Task:
         self.stream: bool = False
         self.stream_queue: Optional[asyncio.Queue] = None
         self.stream_cancelled: bool = False
+        # D-009/D-010 Phase 2: tool calling + harmony reasoning content.
+        # tool_calls = list of OpenAI-shape tool_call dicts (id/type/function).
+        # Ollama emits arguments as dict; hub coerces to JSON-string in response shaping.
+        # reasoning_content = gpt-oss harmony `analysis` channel (Ollama returns as message.thinking).
+        self.tool_calls: list[dict] = []
+        self.reasoning_content: str = ""
 
     # --- Compat shims so existing chat callers keep working unchanged ---
     @property

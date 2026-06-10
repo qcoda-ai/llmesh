@@ -4,8 +4,8 @@ import uuid
 import os
 import secrets
 from collections import OrderedDict
-from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
+from typing import Dict, Any, List, Optional, Union
+from pydantic import BaseModel, ConfigDict
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request, Form, Response, Cookie, Header, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -175,10 +175,12 @@ with open(_version_path) as _vf:
 class InferenceRequest(BaseModel):
     owner_id: str # Added for internal routing
     prompt: Optional[str] = None # Made optional for Anthropic API
-    messages: Optional[List[Dict[str, str]]] = None # Added for Anthropic API
+    messages: Optional[List[Dict[str, Any]]] = None # Added for Anthropic API; Any in value to admit tool_calls list on assistant turns.
     model: str = "llama3"
     num_ctx: Optional[int] = None
     max_tokens: Optional[int] = None
+    tools: Optional[List[Dict[str, Any]]] = None  # D-009 Phase 2
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None  # D-009 Phase 2 — enforced at hub, not forwarded raw (Ollama ignores)
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -195,11 +197,16 @@ class AnthropicRequest(BaseModel):
     max_tokens: int = 1024 # Default for Anthropic API
     stream: bool = False # Not supported yet
     num_ctx: Optional[int] = None
+    tools: Optional[List[Dict[str, Any]]] = None  # D-009 Phase 1: surface, then 400 below.
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
 # OpenAI API Models
 class OpenAIMessage(BaseModel):
+    # D-009 Phase 2 — allow tool_calls / tool_call_id / name on tool-flow turns.
+    # `model_extra` surfaces them for forwarding without per-field schema.
+    model_config = ConfigDict(extra="allow")
     role: str
-    content: str | list  # Accept plain string OR array of content blocks
+    content: Optional[str | list] = None  # Tool turns can have null content.
 
 class OpenAIRequest(BaseModel):
     model: str
@@ -207,6 +214,8 @@ class OpenAIRequest(BaseModel):
     max_tokens: Optional[int] = None
     stream: bool = False
     num_ctx: Optional[int] = None
+    tools: Optional[List[Dict[str, Any]]] = None  # D-009 Phase 1: surface, then 400 below.
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
 limiter = Limiter(
     key_func=_rate_key,
@@ -217,6 +226,11 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 app.add_exception_handler(PayloadTooLarge, _payload_too_large_handler)
 
 STREAM_CHUNK_TIMEOUT = float(os.getenv("STREAM_CHUNK_TIMEOUT", "300.0"))
+
+# D-009/D-010 tool-calling + harmony rollout flag. Default flipped to true
+# alongside the v0.21.0 release (D094 + D095). Operator kill switch lives here
+# for emergency rollback — set `OPENAI_TOOLS_ENABLED=false` in `.env`.
+OPENAI_TOOLS_ENABLED = os.getenv("OPENAI_TOOLS_ENABLED", "true").lower() in ("1", "true", "yes")
 
 # Routing scoring weights (D054 closes D036 §1). The legacy pure-RAM sort
 # overloaded the highest-RAM node even while lower-RAM peers sat idle.
@@ -242,6 +256,10 @@ class StreamChunk(BaseModel):
     # preserve back-compat with agents that haven't been upgraded yet.
     stream_batches: int = 0       # total /stream POSTs this task issued
     stream_final_size: int = 0    # batcher's final per-flush size at end of stream
+    # D-009/D-010 Phase 2: tool calling + harmony reasoning. Populated only on
+    # the done frame for Ollama (Phase 0 verified: one whole-call frame, no deltas).
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    reasoning_content: Optional[str] = None
 
 
 def _is_error_result(result: dict) -> bool:
@@ -530,6 +548,35 @@ def _sse_frame(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
+def _format_tool_calls_for_openai(tool_calls: list[dict]) -> list[dict]:
+    """D-009 Phase 2 — coerce Ollama tool_calls to OpenAI wire shape.
+
+    Ollama 0.30.7 emits `{id, function: {index, name, arguments}}` where
+    `arguments` is a dict (Phase 0 finding). OpenAI's chat.completions wire
+    shape requires `{id, type, function: {name, arguments}}` with `arguments`
+    as a JSON string. The non-standard `function.index` is dropped.
+
+    Idempotent: if a list element already conforms (string arguments, no
+    index), return it untouched.
+    """
+    out = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        elif args is None:
+            args = "{}"
+        out.append({
+            "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": tc.get("type") or "function",
+            "function": {"name": fn.get("name", ""), "arguments": args},
+        })
+    return out
+
+
 def _sse_event(event_name: str, data: dict) -> str:
     """Render a named SSE event (Anthropic-style) — `event:` + `data:` lines.
 
@@ -752,10 +799,38 @@ async def _real_sse_generator(
 
     # Final chunk: finish_reason + usage
     full_response = "".join(accumulated)
+
+    # D-010 Phase 3 — synthesize a single reasoning_content delta before any
+    # tool_call delta. gpt-oss harmony `thinking` channel arrives complete on
+    # the done frame (Phase 0 verified); single-shot emission matches the
+    # actual data shape. Non-standard `delta.reasoning_content` matches the
+    # DeepSeek convention adopted by openai-python + LangChain.
+    if task.reasoning_content:
+        yield _chunk({"reasoning_content": task.reasoning_content})
+
+    # D-009 Phase 2 — synthesize a single tool_call delta before [DONE] when
+    # the agent reported tool_calls on the done frame. Ollama has no incremental
+    # arguments to deliver (Phase 0 verified: whole call in one frame), so a
+    # single-delta synthesis is faithful, not lossy. openai-python + LangChain
+    # both accumulate delta.tool_calls fine.
+    finish_reason = "stop"
+    if task.tool_calls:
+        formatted = _format_tool_calls_for_openai(task.tool_calls)
+        delta_tool_calls = []
+        for idx, tc in enumerate(formatted):
+            delta_tool_calls.append({
+                "index": idx,
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
+            })
+        yield _chunk({"tool_calls": delta_tool_calls})
+        finish_reason = "tool_calls"
+
     yield _sse_frame({
         "id": task_id_str, "object": "chat.completion.chunk",
         "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": task.prompt_tokens,
             "completion_tokens": task.completion_tokens,
@@ -766,7 +841,10 @@ async def _real_sse_generator(
 
     # Save session after stream completes (mirrors non-streaming path in _process_chat_completion)
     store = get_session_store()
-    updated_history = (stored_history or []) + incoming_messages + [{"role": "assistant", "content": full_response}]
+    assistant_turn: dict[str, Any] = {"role": "assistant", "content": full_response}
+    if task.tool_calls:
+        assistant_turn["tool_calls"] = task.tool_calls
+    updated_history = (stored_history or []) + incoming_messages + [assistant_turn]
     await store.save_messages(session_id, owner_id, updated_history)
     if len(updated_history) >= SESSION_MAX_TURNS * 2:
         asyncio.create_task(_compress_session(session_id, owner_id, updated_history, model))
@@ -897,15 +975,19 @@ async def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskR
     else:
         num_ctx = min(int(requested), int(model_ctx_cap))
 
+    task_payload = {
+        "messages": req.messages,
+        "prompt": req.prompt,
+        "num_ctx": num_ctx,
+        "max_tokens": req.max_tokens,
+    }
+    if req.tools:
+        task_payload["tools"] = req.tools
+
     task = tasks.Task(
         task_id=task_id,
         kind=tasks.TaskKind.CHAT,
-        payload={
-            "messages": req.messages,
-            "prompt": req.prompt,
-            "num_ctx": num_ctx,
-            "max_tokens": req.max_tokens,
-        },
+        payload=task_payload,
         model=req.model,
         owner_id=req.owner_id,
     )
@@ -1128,6 +1210,13 @@ async def stream_task_chunk(
         # dashboard task viewer. Zero from older agents that don't send it.
         task.stream_batches = body.stream_batches
         task.stream_final_size = body.stream_final_size
+        # D-009/D-010 Phase 2: capture tool_calls + reasoning_content from the
+        # streaming done frame. SSE generator synthesizes a single OpenAI
+        # tool_call delta before [DONE] when present.
+        if body.tool_calls:
+            task.tool_calls = body.tool_calls
+        if body.reasoning_content:
+            task.reasoning_content = body.reasoning_content
         task.status = "completed"
         _put_or_drop_oldest(None)  # sentinel — SSE generator closes on None
         task.done_event.set()
@@ -1190,6 +1279,11 @@ async def submit_task_result(request: Request, node_id: str, task_id: str, resul
     )
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    # D-009/D-010 Phase 2 — stash tool_calls + reasoning_content from agent
+    # payload. Empty/missing on non-tool / non-harmony responses, which is the
+    # signal the response-shaping code reads (no tool_calls -> finish_reason="stop").
+    task.tool_calls = result.get("tool_calls") or []
+    task.reasoning_content = result.get("reasoning_content") or ""
 
     duration_ms = (time.time() - task.start_time) * 1000.0
     is_error = _is_error_result(result)
@@ -1547,6 +1641,8 @@ async def _process_chat_completion(
     want_stream: bool = False,
     num_ctx: int | None = None,
     max_tokens: int | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
 ) -> tuple:
     owner_id = storage.authenticate_owner(api_key)
     if not owner_id:
@@ -1562,12 +1658,30 @@ async def _process_chat_completion(
     stored_history = await store.get_messages(session_id, owner_id)
     full_messages = (stored_history or []) + messages
 
+    # D-009 Phase 2 — tool_choice enforced at hub because Ollama 0.30.7 ignores
+    # the parameter in all four values (verified Phase 0). "none" => strip
+    # tools entirely so the model never sees the schema. {type:"function",
+    # function:{name:"X"}} => filter tools to just the named one. "required"
+    # is post-validated after the response arrives. "auto" or None is passthrough.
+    effective_tools = tools
+    if tool_choice == "none":
+        effective_tools = None
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        wanted = (tool_choice.get("function") or {}).get("name")
+        if wanted and tools:
+            effective_tools = [
+                t for t in tools
+                if isinstance(t, dict) and (t.get("function") or {}).get("name") == wanted
+            ] or tools
+
     inf_req = InferenceRequest(
         owner_id=owner_id,
         model=req_model,
         messages=full_messages,
         num_ctx=num_ctx,
         max_tokens=max_tokens,
+        tools=effective_tools,
+        tool_choice=tool_choice,
     )
 
     try:
@@ -1593,7 +1707,26 @@ async def _process_chat_completion(
         return None, JSONResponse(status_code=504, content={"error": {"message": "LLMesh task timed out", "type": "timeout"}}), session_id, owner_id, stored_history, messages
 
     if queued_task.status == "completed":
-        updated_history = (stored_history or []) + messages + [{"role": "assistant", "content": queued_task.result}]
+        # D-009 Phase 2 post-validate: tool_choice="required" must produce at
+        # least one tool_call. Ollama 0.30.7 doesn't honor tool_choice so the
+        # model is free to skip the call; hub enforces the contract.
+        if tool_choice == "required" and not queued_task.tool_calls:
+            attempted = [
+                (t.get("function") or {}).get("name")
+                for t in (tools or []) if isinstance(t, dict)
+            ]
+            return None, JSONResponse(
+                status_code=422,
+                content={"error": {
+                    "message": "tool_choice='required' but model emitted no tool_calls",
+                    "type": "tool_choice_required_but_none_emitted",
+                    "attempted_tools": [n for n in attempted if n],
+                }},
+            ), session_id, owner_id, stored_history, messages
+        assistant_turn: dict[str, Any] = {"role": "assistant", "content": queued_task.result or ""}
+        if queued_task.tool_calls:
+            assistant_turn["tool_calls"] = queued_task.tool_calls
+        updated_history = (stored_history or []) + messages + [assistant_turn]
         await store.save_messages(session_id, owner_id, updated_history)
         if len(updated_history) >= SESSION_MAX_TURNS * 2:
             asyncio.create_task(_compress_session(session_id, owner_id, updated_history, req_model))
@@ -1614,6 +1747,16 @@ async def openai_chat_completions(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Authorization header")
 
+    if (req.tools or req.tool_choice) and not OPENAI_TOOLS_ENABLED:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "message": "tools/tool_choice not yet supported on this hub. Track .qcoda/discussions.md::D-009 / feature_openai_tools_harmony.md.",
+                "type": "unsupported_param",
+                "param": "tools" if req.tools else "tool_choice",
+            }},
+        )
+
     # QCoda LAB-006 cross-stack correlation hook. QCoda injects this header
     # via lib/agents/base.py::_call_llm (QCoda D-084 / nodemesh-side log
     # surface for joint qcoda + llmesh + ollama lab rig). Logged at INFO so
@@ -1633,11 +1776,23 @@ async def openai_chat_completions(
             )
         return content or ""
 
-    messages = [{"role": m.role, "content": extract_content(m.content)} for m in req.messages]
+    def _msg_to_dict(m) -> dict:
+        # D-009 Phase 2 — preserve tool_calls + tool_call_id + name on multi-turn
+        # tool flows. Pydantic's `extra="allow"` on OpenAIMessage lets these ride
+        # in via model_extra; surface them on the wire-shape dict we forward.
+        out: dict[str, Any] = {"role": m.role, "content": extract_content(m.content)}
+        extras = getattr(m, "model_extra", None) or {}
+        for k in ("tool_calls", "tool_call_id", "name"):
+            if k in extras and extras[k] is not None:
+                out[k] = extras[k]
+        return out
+
+    messages = [_msg_to_dict(m) for m in req.messages]
 
     task, err_resp, session_id, owner_id, stored_history, incoming_messages = await _process_chat_completion(
         req.model, messages, api_key, x_session_id, want_stream=req.stream,
-        num_ctx=req.num_ctx, max_tokens=req.max_tokens
+        num_ctx=req.num_ctx, max_tokens=req.max_tokens,
+        tools=req.tools, tool_choice=req.tool_choice,
     )
     if err_resp:
         return err_resp
@@ -1679,6 +1834,14 @@ async def openai_chat_completions(
 
     response.headers["X-Session-ID"] = session_id
     response.headers["X-Retry-Count"] = str(retry_count)
+    message: dict[str, Any] = {"role": "assistant", "content": task.result or ""}
+    finish_reason = "stop"
+    if task.tool_calls:
+        message["tool_calls"] = _format_tool_calls_for_openai(task.tool_calls)
+        finish_reason = "tool_calls"
+    if task.reasoning_content:
+        message["reasoning_content"] = task.reasoning_content
+        response.headers["X-LLMesh-Reasoning-Content"] = "present"
     return {
         "id": task_id,
         "object": "chat.completion",
@@ -1686,11 +1849,8 @@ async def openai_chat_completions(
         "model": req.model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": task.result,
-            },
-            "finish_reason": "stop"
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": {
             "prompt_tokens": task.prompt_tokens,
@@ -1710,6 +1870,16 @@ async def anthropic_messages(
 ):
     if not x_api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing x-api-key header")
+
+    if (req.tools or req.tool_choice) and not OPENAI_TOOLS_ENABLED:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "message": "tools/tool_choice not yet supported on this hub. Track .qcoda/discussions.md::D-009 / feature_openai_tools_harmony.md.",
+                "type": "unsupported_param",
+                "param": "tools" if req.tools else "tool_choice",
+            }},
+        )
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     task, err_resp, session_id, _owner_id, _stored_history, _incoming = await _process_chat_completion(

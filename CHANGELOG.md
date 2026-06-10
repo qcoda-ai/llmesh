@@ -8,7 +8,36 @@ Per-change provenance lives in [`.qcoda/decisions.md`](.qcoda/decisions.md) — 
 
 ## [Unreleased]
 
-Targeted for the next patch on top of v0.20.1. Tag pending.
+Targeted for the next patch on top of v0.21.0. Tag pending.
+
+---
+
+## [0.21.0] — 2026-06-10 — OpenAI tool calling + harmony reasoning (Ollama backend)
+
+Minor bump because `/v1/chat/completions` gains new response fields (`message.tool_calls`, `message.reasoning_content`) and the streaming wire shape gains two new delta types (`delta.tool_calls`, `delta.reasoning_content`). Closes D-009 + D-010 — first triggered by a qcoda customer report 2026-06-10 that `tool_choice="required"` against `qwen3-coder:30b` on `mesh.qcoda.com/v1` was silently dropping the request. Root cause was Pydantic schema not declaring the fields; Ollama itself also silently ignores `tool_choice` (verified Phase 0), so the hub now enforces all four `tool_choice` values client-side.
+
+### Added
+- **OpenAI tool calling — Ollama backend, non-streaming + streaming** (D094, closes D-009). `POST /v1/chat/completions` now accepts `tools=[...]` + `tool_choice=...` on the request and returns `message.tool_calls` in OpenAI wire shape on the response. Streaming path emits a single `delta.tool_calls` chunk before `finish_reason="tool_calls"`. Multi-turn round-trip with `role:"tool"` + `tool_call_id` works against `qwen3-coder:30b` (and any other Ollama-supported tool-trained model — `qwen2.5`, `llama3.1`, `llama3.2`, `mistral-nemo`, `granite`). Hub enforces all four `tool_choice` values: `"auto"` (passthrough), `"none"` (strip tools before forwarding), `{type:"function",function:{name:"X"}}` (filter tools to the named one), `"required"` (forward + post-validate — emits `422 tool_choice_required_but_none_emitted` if model declined). Phase 2 finding: Ollama 0.30.7 requires `tool_calls[].function.arguments` as **dict** (not JSON-string) in history turns for multi-turn flows — agent un-coerces transparently before forwarding. Operator kill switch: `OPENAI_TOOLS_ENABLED=false`. Default ON. Verified end-to-end against real Ollama. Full plan + Phase 0 wire-shape findings in `.qcoda/features/feature_openai_tools_harmony.md`.
+- **Reasoning content passthrough (gpt-oss harmony) — Ollama backend, non-streaming + streaming** (D095, closes D-010). `POST /v1/chat/completions` returns `message.reasoning_content` on the response when the model emits a `thinking` field (Ollama 0.30.7 splits gpt-oss harmony `analysis` channel into `message.thinking` automatically — Phase 0 verified). Streaming emits a single `delta.reasoning_content` chunk before any tool_call delta. Non-standard field name follows DeepSeek convention (also adopted by `openai-python` + LangChain). Response header `X-LLMesh-Reasoning-Content: present` set when populated.
+
+### Changed
+- `OPENAI_TOOLS_ENABLED` default flipped from `false` to `true` alongside this release (was Phase 1 default in v0.20.x). Operators wanting the old behavior set `OPENAI_TOOLS_ENABLED=false`. Phase 1's loud-reject (400 `unsupported_param`) still triggers when the flag is off.
+- `OpenAIRequest` Pydantic schema now declares `tools` + `tool_choice`. Phase 1 silently fixed this in v0.20.x via schema-only addition; v0.21.0 wires the plumb-through.
+- `OpenAIMessage` Pydantic schema now allows `extra` fields (`tool_calls`, `tool_call_id`, `name`) so multi-turn tool flows round-trip. Content is now nullable for assistant-with-tool_calls turns.
+- `_real_sse_generator` order: `delta.reasoning_content` (if present) → `delta.tool_calls` (if present) → `finish_reason` frame → `[DONE]`. Existing token-content path unchanged.
+
+### Not yet covered
+- **vLLM** backend — `tools` + `tool_choice` not forwarded; `reasoning_content` not extracted. vLLM's tool surface uses a different parser model (`--enable-auto-tool-choice --tool-call-parser hermes`) and has true incremental `tool_call.arguments` streaming deltas. Separate plumbing; deferred to a future minor.
+- **MLX** backend — same. osaurus supports OpenAI-shape tools natively but unwired; mlx-lm.server tools support is model-dependent.
+- **Anthropic `/v1/messages`** — schema accepts `tools` + `tool_choice` (Phase 1) but Phase 2 plumb-through is OpenAI-only. Anthropic-shape callers still get the Phase 1 400 reject if they send tools (with default flag on, the request bypasses the gate but the hub never forwards `tools` to the agent on the Anthropic path). Track in `.qcoda/discussions.md` for the follow-up.
+- **qwen3-thinking `<think>` blocks (MLX)** — different shape from gpt-oss harmony; not handled. `lib/agent/client.py:1039` notes the case for a future patch.
+- **Streaming `tool_call.arguments` incremental deltas** — Ollama emits the whole tool_call in one frame (Phase 0 verified). Hub synthesizes a single OpenAI delta containing the whole call. openai-python + LangChain accumulate it correctly; clients expecting true per-token arguments deltas will not see them on the Ollama backend.
+
+### Cross-references
+- `decisions.md::D094` (Phase 2 — Ollama tools end-to-end), `decisions.md::D095` (Phase 3 — harmony channel passthrough), `decisions.md::D096` (v0.21.0 release).
+- `decisions.md::D093` (Phase 1 schema + loud-reject — shipped in v0.20.x, now superseded by D094 plumb-through but retained as the rollout-flag mechanism).
+- `.qcoda/features/feature_openai_tools_harmony.md` (full plan + verified Ollama 0.30.7 wire shapes).
+- `.qcoda/api.md` — new "Tool calling (Ollama backend, BETA)" + "Reasoning content (Ollama backend)" sections.
 
 ---
 
