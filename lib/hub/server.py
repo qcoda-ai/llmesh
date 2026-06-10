@@ -1171,6 +1171,12 @@ async def get_pending_tasks_for_node(request: Request, node_id: str, _: None = D
             entry["messages"] = t.messages
             entry["num_ctx"] = t.num_ctx
             entry["max_tokens"] = t.max_tokens
+            # D098 — agent reads task.get("tools") from top level (lib/agent/client.py
+            # streaming + non-stream Ollama branches). Without this flatten, tools live
+            # only in payload["tools"] and silently never reach Ollama. Verified via
+            # curl probe against mesh.qcoda.com (qwen3-coder:30b + gpt-oss:20b both
+            # returned finish_reason=stop with prompt_tokens=13/72 — tool schema absent).
+            entry["tools"] = t.tools
         out.append(entry)
     return out
 
@@ -1722,15 +1728,25 @@ async def _process_chat_completion(
         # D-009 Phase 2 post-validate: tool_choice="required" must produce at
         # least one tool_call. Ollama 0.30.7 doesn't honor tool_choice so the
         # model is free to skip the call; hub enforces the contract.
-        if tool_choice == "required" and not queued_task.tool_calls:
+        # D098 — same enforcement extended to named-function form
+        # {"type":"function","function":{"name":"X"}}. Symmetric with "required"
+        # — qcoda's named-function probe was silently returning 200+content
+        # before the fix because filter-to-one-tool relies on model cooperation.
+        _named_func = (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and (tool_choice.get("function") or {}).get("name")
+        )
+        if (tool_choice == "required" or _named_func) and not queued_task.tool_calls:
             attempted = [
                 (t.get("function") or {}).get("name")
                 for t in (tools or []) if isinstance(t, dict)
             ]
+            requested_choice = tool_choice if tool_choice == "required" else _named_func
             return None, JSONResponse(
                 status_code=422,
                 content={"error": {
-                    "message": "tool_choice='required' but model emitted no tool_calls",
+                    "message": f"tool_choice={requested_choice!r} but model emitted no tool_calls",
                     "type": "tool_choice_required_but_none_emitted",
                     "attempted_tools": [n for n in attempted if n],
                 }},

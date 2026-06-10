@@ -363,3 +363,101 @@ def test_route_phase2_no_node_returns_503_not_400_with_tools(client, monkeypatch
     if resp.status_code == 400:
         body = resp.json()
         assert body.get("error", {}).get("type") != "unsupported_param"
+
+
+# --- D098 — hub→agent serialization carries tools (the prod bug) ---
+
+
+def test_pending_task_serialization_flattens_tools_to_top_level():
+    """Hub places tools in payload["tools"]; agent reads task.get("tools") from
+    the top level. Without flatten the tools silently never reach Ollama.
+    Verified in prod 2026-06-10 via curl probe — qwen3-coder + gpt-oss both
+    returned finish_reason=stop / tool_calls=None with prompt_tokens=13/72
+    (tool schema absent from upstream prompt). D098."""
+    from lib.hub import tasks as ht
+    tools = [{"type": "function", "function": {"name": "git_ls_files",
+              "description": "ls", "parameters": {"type": "object"}}}]
+    t = ht.Task(
+        task_id="t-d098",
+        kind=ht.TaskKind.CHAT,
+        model="qwen3-coder:30b",
+        owner_id="o1",
+        messages=[{"role": "user", "content": "list files"}],
+    )
+    t.payload["tools"] = tools
+
+    # Mirror the entry-build shape from get_pending_tasks_for_node.
+    entry = {
+        "task_id": t.task_id,
+        "kind": t.kind.value,
+        "payload": t.payload,
+        "model": t.model,
+        "stream": t.stream,
+    }
+    if t.kind is ht.TaskKind.CHAT:
+        entry["prompt"] = t.prompt
+        entry["messages"] = t.messages
+        entry["num_ctx"] = t.num_ctx
+        entry["max_tokens"] = t.max_tokens
+        entry["tools"] = t.tools
+
+    assert entry["tools"] == tools, "tools must be flattened to top level so agent.get('tools') sees them"
+
+
+def test_task_tools_property_returns_payload_tools_for_chat():
+    from lib.hub import tasks as ht
+    tools = [{"type": "function", "function": {"name": "x"}}]
+    t = ht.Task("tx", kind=ht.TaskKind.CHAT, model="m", owner_id="o")
+    t.payload["tools"] = tools
+    assert t.tools == tools
+
+
+def test_task_tools_property_returns_none_for_non_chat():
+    from lib.hub import tasks as ht
+    t = ht.Task("ty", kind=ht.TaskKind.EMBEDDING, model="m", owner_id="o")
+    t.payload["tools"] = [{"function": {"name": "x"}}]
+    assert t.tools is None, "tools only meaningful on CHAT tasks"
+
+
+def test_named_function_tool_choice_post_validate_fires_when_empty(client, monkeypatch):
+    """D098 — named-function tool_choice MUST 422 when model emits no tool_calls,
+    symmetric with tool_choice='required'. Pre-fix, named-function form silently
+    returned 200+content (qcoda symptom). Forces the contract."""
+    monkeypatch.setattr(server, "OPENAI_TOOLS_ENABLED", True)
+    # Test-suite ordering can leave api_keys unpopulated; patch storage auth.
+    from lib.hub import storage as _storage
+    monkeypatch.setattr(_storage, "authenticate_owner", lambda k: "test-owner" if k == "my_secret_key_1" else None)
+
+    async def _fake_route(req, stream=False):
+        from lib.hub import tasks as ht
+        # Simulate the model returning content with no tool_calls.
+        task = ht.Task(
+            task_id="t-named",
+            kind=ht.TaskKind.CHAT,
+            model=req.model,
+            owner_id=req.owner_id,
+            messages=req.messages,
+        )
+        task.status = "completed"
+        task.result = "I would call ls but cannot"
+        task.tool_calls = []
+        task.done_event.set()
+        from lib.hub import tasks as _t
+        _t._task_index[task.task_id] = task
+        _t._node_tasks.setdefault("fake-node", []).append(task)
+        from lib.hub.server import TaskResponse
+        return TaskResponse(task_id=task.task_id, node_assigned="fake-node",
+                             status="completed", model=req.model)
+
+    monkeypatch.setattr(server, "_route_inference", _fake_route)
+
+    resp = client.post("/v1/chat/completions", headers=_AUTH, json={
+        "model": "qwen3-coder:30b",
+        "messages": [{"role": "user", "content": "list files"}],
+        "tools": _TOOLS_REQ,
+        "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
+    })
+    assert resp.status_code == 422, f"expected 422 for unfulfilled named-function tool_choice, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["error"]["type"] == "tool_choice_required_but_none_emitted"
+    assert "get_current_weather" in body["error"]["attempted_tools"]
