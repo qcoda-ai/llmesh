@@ -577,6 +577,37 @@ def _format_tool_calls_for_openai(tool_calls: list[dict]) -> list[dict]:
     return out
 
 
+def _format_tool_calls_for_anthropic(tool_calls: list[dict]) -> list[dict]:
+    """D099 — convert stored Ollama tool_calls to Anthropic `tool_use` content blocks.
+
+    Anthropic Messages shape: `{type:"tool_use", id, name, input:{...}}` where
+    `input` is an OBJECT (not a JSON string — the inverse of the OpenAI wire
+    shape in `_format_tool_calls_for_openai`). Ollama 0.30.7 emits `arguments`
+    as a dict; the OpenAI-shape path may already have stringified it, so accept
+    both and coerce to a dict.
+    """
+    out = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except json.JSONDecodeError:
+                args = {}
+        elif not isinstance(args, dict):
+            args = {}
+        out.append({
+            "type": "tool_use",
+            "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": fn.get("name", ""),
+            "input": args,
+        })
+    return out
+
+
 def _sse_event(event_name: str, data: dict) -> str:
     """Render a named SSE event (Anthropic-style) — `event:` + `data:` lines.
 
@@ -724,13 +755,31 @@ async def _real_sse_generator_anthropic(
         "index": 0,
     })
 
+    # 3b. D099 — tool_use content blocks. tool_calls arrive complete on the
+    #     done frame (same shape as reasoning_content), so each block's input
+    #     is emitted as a single input_json_delta rather than streamed partials.
+    tool_use_blocks = _format_tool_calls_for_anthropic(getattr(task, "tool_calls", None))
+    for i, blk in enumerate(tool_use_blocks, start=1):
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start", "index": i,
+            "content_block": {"type": "tool_use", "id": blk["id"], "name": blk["name"], "input": {}},
+        })
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": i,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(blk["input"])},
+        })
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": i})
+
     # 4. message_delta — top-level stop_reason + cumulative output_tokens.
     #    Per docs Warning callout: "The token counts shown in the `usage` field
     #    of the `message_delta` event are *cumulative*."
     output_tokens = task.completion_tokens or 0
     yield _sse_event("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "delta": {
+            "stop_reason": "tool_use" if tool_use_blocks else "end_turn",
+            "stop_sequence": None,
+        },
         "usage": {"output_tokens": output_tokens},
     })
 
@@ -1910,9 +1959,14 @@ async def anthropic_messages(
         )
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    # D099 — forward tools/tool_choice through the same hub-enforced pipeline as
+    # the OpenAI endpoint. Previously dropped here: the model never saw the tool
+    # schema, so /v1/messages silently emitted 0 tool calls (same bug class as
+    # D094/D098, which only wired /v1/chat/completions).
     task, err_resp, session_id, _owner_id, _stored_history, _incoming = await _process_chat_completion(
         req.model, messages, x_api_key, x_session_id,
         want_stream=req.stream, num_ctx=req.num_ctx, max_tokens=req.max_tokens,
+        tools=req.tools, tool_choice=req.tool_choice,
     )
     if err_resp:
         return err_resp
@@ -1966,9 +2020,26 @@ async def anthropic_messages(
                 "delta": {"type": "text_delta", "text": task.result or ""},
             })
             yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            # D099 — emit one tool_use content block per tool call. tool_use
+            # input streams as partial_json; we have the complete args here
+            # (done frame), so emit it as a single input_json_delta.
+            tool_use_blocks = _format_tool_calls_for_anthropic(task.tool_calls)
+            for i, blk in enumerate(tool_use_blocks, start=1):
+                yield _sse_event("content_block_start", {
+                    "type": "content_block_start", "index": i,
+                    "content_block": {"type": "tool_use", "id": blk["id"], "name": blk["name"], "input": {}},
+                })
+                yield _sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": i,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(blk["input"])},
+                })
+                yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": i})
             yield _sse_event("message_delta", {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {
+                    "stop_reason": "tool_use" if tool_use_blocks else "end_turn",
+                    "stop_sequence": None,
+                },
                 "usage": {"output_tokens": task.completion_tokens or 0},
             })
             yield _sse_event("message_stop", {"type": "message_stop"})
@@ -1978,18 +2049,25 @@ async def anthropic_messages(
     response.headers["X-Session-ID"] = session_id
     response.headers["X-Retry-Count"] = str(task.initial_retries - task.retries_left)
 
+    # D099 — assemble content blocks: a text block (when the model emitted
+    # final text) followed by one tool_use block per tool call. stop_reason
+    # flips to "tool_use" when any tool call is present (Anthropic contract).
+    content_blocks: list[dict[str, Any]] = []
+    if task.result:
+        content_blocks.append({"type": "text", "text": task.result})
+    tool_use_blocks = _format_tool_calls_for_anthropic(task.tool_calls)
+    content_blocks.extend(tool_use_blocks)
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+    if task.reasoning_content:
+        response.headers["X-LLMesh-Reasoning-Content"] = "present"
     return {
         "id": f"msg_{task.task_id}",
         "type": "message",
         "role": "assistant",
         "model": req.model,
-        "content": [
-            {
-                "type": "text",
-                "text": task.result
-            }
-        ],
-        "stop_reason": "end_turn",
+        "content": content_blocks,
+        "stop_reason": "tool_use" if tool_use_blocks else "end_turn",
         "stop_sequence": None,
         "usage": {
             "input_tokens": task.prompt_tokens,

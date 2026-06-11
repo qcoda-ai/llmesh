@@ -461,3 +461,216 @@ def test_named_function_tool_choice_post_validate_fires_when_empty(client, monke
     body = resp.json()
     assert body["error"]["type"] == "tool_choice_required_but_none_emitted"
     assert "get_current_weather" in body["error"]["attempted_tools"]
+
+
+# --- D099 — close the silent-drop gaps D098 left open ---
+#   (a) /v1/messages (Anthropic) forwards tools + surfaces tool_use
+#   (b) agent vLLM/MLX OpenAI-compat path forwards tools + parses tool_calls
+#   + DoD regressions for the OpenAI/harmony path that D094/D095 fixed.
+
+
+def _install_fake_route(monkeypatch, *, result, tool_calls=None, reasoning="",
+                        prompt_tokens=11, completion_tokens=7):
+    """Patch storage auth + _route_inference so the endpoint handlers run end to
+    end against a synthetic completed task (no live node needed)."""
+    from lib.hub import storage as _storage
+    monkeypatch.setattr(server, "OPENAI_TOOLS_ENABLED", True)
+    monkeypatch.setattr(_storage, "authenticate_owner",
+                        lambda k: "test-owner" if k == "my_secret_key_1" else None)
+
+    async def _fake_route(req, stream=False):
+        from lib.hub import tasks as ht
+        task = ht.Task(task_id="t-d099", kind=ht.TaskKind.CHAT, model=req.model,
+                       owner_id=req.owner_id, messages=req.messages)
+        task.status = "completed"
+        task.result = result
+        task.tool_calls = tool_calls or []
+        task.reasoning_content = reasoning
+        task.prompt_tokens = prompt_tokens
+        task.completion_tokens = completion_tokens
+        task.done_event.set()
+        ht._task_index[task.task_id] = task
+        ht._node_tasks.setdefault("fake-node", []).append(task)
+        from lib.hub.server import TaskResponse
+        return TaskResponse(task_id=task.task_id, node_assigned="fake-node",
+                            status="completed", model=req.model)
+
+    monkeypatch.setattr(server, "_route_inference", _fake_route)
+
+
+# (a.0) the Anthropic tool_use formatter
+
+def test_format_tool_calls_for_anthropic_coerces_string_args_to_dict():
+    out = server._format_tool_calls_for_anthropic(
+        [{"id": "c1", "type": "function",
+          "function": {"name": "git_ls_files", "arguments": '{"pattern": "*.py"}'}}])
+    assert out == [{"type": "tool_use", "id": "c1", "name": "git_ls_files",
+                    "input": {"pattern": "*.py"}}]
+
+
+def test_format_tool_calls_for_anthropic_passes_dict_args():
+    out = server._format_tool_calls_for_anthropic(
+        [{"id": "c2", "function": {"name": "n", "arguments": {"a": 1}}}])
+    assert out[0]["input"] == {"a": 1} and out[0]["type"] == "tool_use"
+
+
+def test_format_tool_calls_for_anthropic_handles_missing_id_and_bad_json():
+    out = server._format_tool_calls_for_anthropic(
+        [{"function": {"name": "x", "arguments": "not-json"}}])
+    assert out[0]["input"] == {} and out[0]["id"].startswith("toolu_")
+
+
+def test_format_tool_calls_for_anthropic_empty():
+    assert server._format_tool_calls_for_anthropic([]) == []
+    assert server._format_tool_calls_for_anthropic(None) == []
+
+
+# (a.1) /v1/messages forwards tools and emits a tool_use block
+
+def test_anthropic_messages_surfaces_tool_use_block(client, monkeypatch):
+    """Pre-D099 /v1/messages dropped tools/tool_choice and could only emit a
+    text block — silent 0-tool-call. Now it must return a tool_use block and
+    stop_reason='tool_use'."""
+    _install_fake_route(monkeypatch, result="",
+                        tool_calls=[{"id": "call_z", "function":
+                                     {"name": "git_ls_files", "arguments": {"pattern": "*"}}}])
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "gpt-oss:20b", "max_tokens": 256,
+        "messages": [{"role": "user", "content": "list files"}],
+        "tools": [{"type": "function", "function": {"name": "git_ls_files",
+                   "parameters": {"type": "object", "properties": {}}}}],
+        "tool_choice": {"type": "function", "function": {"name": "git_ls_files"}},
+    })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stop_reason"] == "tool_use"
+    uses = [b for b in body["content"] if b["type"] == "tool_use"]
+    assert len(uses) == 1
+    assert uses[0]["name"] == "git_ls_files"
+    assert uses[0]["input"] == {"pattern": "*"}
+
+
+def test_anthropic_messages_text_only_is_end_turn(client, monkeypatch):
+    _install_fake_route(monkeypatch, result="hello there")
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "gpt-oss:20b", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == [{"type": "text", "text": "hello there"}]
+
+
+# (a.2) Anthropic streaming generator emits tool_use content blocks
+
+def test_anthropic_sse_emits_tool_use_blocks():
+    import asyncio
+    from lib.hub import tasks as ht
+    task = ht.Task("t-asse", model="gpt-oss:20b", owner_id="o")
+    task.stream_queue = asyncio.Queue()
+    task.created_at = 0.0
+    task.tool_calls = [{"id": "call_a", "function":
+                        {"name": "git_grep", "arguments": {"pattern": "def foo"}}}]
+
+    async def go():
+        await task.stream_queue.put(None)
+        frames = await _drain(server._real_sse_generator_anthropic(
+            task, request=None, message_id="msg_x", model="gpt-oss:20b",
+            input_tokens_estimate=5))
+        return "".join(frames)
+
+    out = asyncio.run(go())
+    assert '"type": "tool_use"' in out
+    assert "git_grep" in out
+    assert "input_json_delta" in out and "def foo" in out
+    assert '"stop_reason": "tool_use"' in out
+
+
+# (b) agent vLLM/MLX path forwards tools + parses tool_calls (real dispatch)
+
+def test_agent_mlx_path_forwards_tools_and_parses_tool_calls(monkeypatch):
+    """D099 — the OpenAI-compat (vLLM/MLX) branch of _run_single_task previously
+    built req_body without `tools` and ignored `tool_calls` in the response.
+    Drive the real function with a MockTransport backend + capture the hub
+    submit payload."""
+    import asyncio, json as _json, httpx
+    from lib.agent import client as agent
+
+    monkeypatch.setattr(agent, "MLX_HOST", "http://mlx.test")
+    monkeypatch.setattr(agent, "HUB_URL", "http://hub.test")
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "mlx.test":
+            sent = _json.loads(request.content)
+            captured["backend_body"] = sent
+            return httpx.Response(200, json={
+                "choices": [{"message": {
+                    "content": "",
+                    "tool_calls": [{"id": "call_m", "type": "function",
+                                    "function": {"name": "git_ls_files", "arguments": "{}"}}],
+                }}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+            })
+        # hub /complete
+        captured["submit_body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"status": "ok"})
+
+    state = agent.AppState()
+    state.node_id = "node-1"
+    state.node_token = "tok"
+    state.mlx_models = ["my-mlx-model"]
+    task = {
+        "task_id": "tk1", "model": "my-mlx-model", "kind": "chat",
+        "messages": [{"role": "user", "content": "list files"}],
+        "tools": [{"type": "function", "function": {"name": "git_ls_files",
+                   "parameters": {"type": "object", "properties": {}}}}],
+    }
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            await agent._run_single_task(c, state, task)
+
+    asyncio.run(go())
+    assert "tools" in captured["backend_body"], "tools must be forwarded to the MLX/vLLM backend"
+    assert captured["submit_body"].get("tool_calls"), "tool_calls must be submitted back to the hub"
+    assert captured["submit_body"]["tool_calls"][0]["function"]["name"] == "git_ls_files"
+
+
+# DoD regressions on the OpenAI/harmony path (D094/D095 — must stay fixed)
+
+def test_openai_gpt_oss_content_clean_and_reasoning_separated(client, monkeypatch):
+    """BUG 1 guard: final channel maps to content, analysis to reasoning_content,
+    no raw <|channel|> control tokens leak into content."""
+    _install_fake_route(monkeypatch, result="ready",
+                        reasoning="The user wants exactly: ready.")
+    resp = client.post("/v1/chat/completions", headers=_AUTH, json={
+        "model": "gpt-oss:20b",
+        "messages": [{"role": "user", "content": "reply with exactly: ready"}],
+    })
+    assert resp.status_code == 200, resp.text
+    msg = resp.json()["choices"][0]["message"]
+    assert msg["content"] == "ready"
+    assert "<|channel|>" not in msg["content"] and "<|message|>" not in msg["content"]
+    assert msg["reasoning_content"] == "The user wants exactly: ready."
+
+
+def test_openai_named_tool_choice_roundtrip_produces_tool_call(client, monkeypatch):
+    """BUG 2 guard: named-function tool_choice that DOES produce a tool_call
+    returns 200 with finish_reason=tool_calls (not dropped, not 422)."""
+    _install_fake_route(monkeypatch, result="",
+                        tool_calls=[{"id": "call_g", "function":
+                                     {"name": "git_ls_files", "arguments": {}}}])
+    resp = client.post("/v1/chat/completions", headers=_AUTH, json={
+        "model": "gpt-oss:20b",
+        "messages": [{"role": "user", "content": "list files"}],
+        "tools": [{"type": "function", "function": {"name": "git_ls_files",
+                   "parameters": {"type": "object", "properties": {}}}}],
+        "tool_choice": {"type": "function", "function": {"name": "git_ls_files"}},
+    })
+    assert resp.status_code == 200, resp.text
+    choice = resp.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "git_ls_files"

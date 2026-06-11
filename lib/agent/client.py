@@ -1471,6 +1471,15 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
             }
             if task.get("max_tokens"):
                 req_body["max_tokens"] = task["max_tokens"]
+            # D099 — forward tools to the OpenAI-compatible backend. Both vLLM
+            # and MLX (osaurus) honor /v1/chat/completions `tools`. Previously
+            # dropped here, so tool-using models silently made 0 calls when they
+            # landed on a non-Ollama node (latent until a tool model is served
+            # off Ollama). tool_choice stays hub-enforced (filtered into `tools`
+            # for named-fn/none + post-validated for required/named-fn), matching
+            # the Ollama path's contract — so it is intentionally not forwarded.
+            if task.get("tools"):
+                req_body["tools"] = task["tools"]
             resp = await client.post(
                 f"{base_url}/v1/chat/completions",
                 json=req_body,
@@ -1478,11 +1487,18 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
             )
             if resp.status_code == 200:
                 data = resp.json()
-                output_text = data["choices"][0]["message"]["content"]
+                resp_msg = data["choices"][0]["message"]
+                output_text = resp_msg.get("content") or ""
+                # D099 — surface tool_calls + reasoning_content from the
+                # backend so the hub can shape them (same fields the Ollama
+                # branch populates). vLLM emits OpenAI-shape tool_calls;
+                # reasoning_content present on reasoning models (DeepSeek-style).
+                tool_calls = resp_msg.get("tool_calls") or []
+                reasoning_content = resp_msg.get("reasoning_content") or ""
                 usage = data.get("usage", {})
                 p_tokens = usage.get("prompt_tokens", 0)
                 c_tokens = usage.get("completion_tokens", 0)
-                logger.info("✅ [%s] Done. Tokens P:%s C:%s", task_id, p_tokens, c_tokens)
+                logger.info("✅ [%s] Done. Tokens P:%s C:%s tool_calls=%d", task_id, p_tokens, c_tokens, len(tool_calls))
             else:
                 output_text = f"Error from {backend}: {resp.status_code} - {resp.text}"
                 is_error = True
