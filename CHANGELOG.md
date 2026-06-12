@@ -8,7 +8,33 @@ Per-change provenance lives in [`.qcoda/decisions.md`](.qcoda/decisions.md) — 
 
 ## [Unreleased]
 
-Targeted for the next patch on top of v0.21.1. Tag pending.
+_Nothing yet._
+
+---
+
+## [0.21.3] — 2026-06-11 — Close remaining tool silent-drops (`/v1/messages` + vLLM/MLX)
+
+Patch. Closes the last two same-class silent tool-drops left after D094/D098, on code paths an OpenAI-endpoint + Ollama-backend caller never exercises (hence invisible to the original repro but live defects). The originally-reported qcoda symptoms were already fixed on `/v1/chat/completions` as of 0.21.2 — exhaustive prod probing confirmed that AND surfaced these two adjacent gaps.
+
+### Fixed
+- **`/v1/messages` (Anthropic endpoint) now forwards `tools` + `tool_choice`** (D099). Previously `anthropic_messages` gated on `OPENAI_TOOLS_ENABLED` but, with the flag ON, called `_process_chat_completion` without passing the tool params — so the model never saw the schema and could not emit a tool call (text-only response, `stop_reason:end_turn`). Now forwards both (same hub-enforced filter/post-validate as the OpenAI path) and emits Anthropic-native `tool_use` content blocks via new `_format_tool_calls_for_anthropic()` (input is an object, inverse of the OpenAI JSON-string shape), flipping `stop_reason` to `"tool_use"`. Streaming (`_real_sse_generator_anthropic` + fake-SSE fallback) emits `content_block_start`/`input_json_delta`/`content_block_stop` per tool_use + `message_delta` stop_reason. Verified on prod: tool schema present (`input_tokens=117` vs `69` absent), `content:[{type:"tool_use",...}]`.
+- **Agent vLLM/MLX non-streaming path now forwards tools + parses `tool_calls`/`reasoning_content`** (D099, closes the D098-deferred gap). `_run_single_task`'s OpenAI-compat branch built `req_body` without `tools` and ignored tool/reasoning fields in the response. Latent because the prod fleet serves tool models via Ollama; reached an operator only when a tool model landed on a vLLM/MLX node. `tool_choice` stays hub-enforced (not forwarded), matching the Ollama contract.
+
+### Cross-references
+- `decisions.md::D099` (this patch), `decisions.md::D098` (pre-allocated D099), `decisions.md::D094`/`D095` (original plumb-through), `decisions.md::D061` (Anthropic streaming endpoint), `decisions.md::D074` (version-bump law).
+
+---
+
+## [0.21.2] — 2026-06-10 — Hub→agent tools serialization + named-function `tool_choice` post-validate
+
+Patch. Closes the qcoda-reported `tool_calls:null` against `mesh.qcoda.com` for `qwen3-coder:30b` (Ollama-served). D094 shipped with isolated-layer unit tests but no end-to-end probe through the real serialization seam; this fixes the seam.
+
+### Fixed
+- **Hub→agent serialization now carries `tools`** (D098). `get_pending_tasks_for_node` flattened `prompt`/`messages`/`num_ctx`/`max_tokens` from `task.payload` to the agent-poll entry top level but not `tools` — the agent reads `task.get("tools")` from top level, got `None`, and posted the Ollama body without tools, so the model never saw the schema (confirmed on prod: tool schema absent from upstream prompt). Now flattens `tools` and adds a `Task.tools` property mirroring the others.
+- **Named-function `tool_choice` now post-validates** (D098). `tool_choice="required"` already 422'd (`tool_choice_required_but_none_emitted`) when the model emitted no call; the `{type:"function",function:{name:"X"}}` form did not — it fell through to 200 + content. Enforcement is now symmetric: both forms 422 with `attempted_tools` populated when no tool call is emitted.
+
+### Cross-references
+- `decisions.md::D098` (this patch), `decisions.md::D094` (the partial plumb-through it patches), `decisions.md::D074` (version-bump law).
 
 ---
 

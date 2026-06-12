@@ -23,7 +23,22 @@ Other v0.2 wins: Anthropic Messages SSE streaming on `/v1/messages` (D061), vLLM
 
 - **Tool calling on `/v1/chat/completions` against the Ollama backend** (D094, BETA). Send standard OpenAI `tools=[...]` + `tool_choice=...`; receive `message.tool_calls` in OpenAI wire shape. Multi-turn round-trip with `role:"tool"` works. `tool_choice` enforced at the hub for all four values (`"auto"` / `"none"` / `{type:"function",...}` / `"required"`) because Ollama itself silently ignores the parameter. Streaming supported via single synthesized `delta.tool_calls` chunk. Operator kill switch: `OPENAI_TOOLS_ENABLED=false`. Default `true`.
 - **Reasoning content passthrough — gpt-oss harmony** (D095). When a model emits structured reasoning (Ollama splits gpt-oss harmony `analysis` channel into `message.thinking`), the hub returns it as `message.reasoning_content` on the OpenAI response, plus `X-LLMesh-Reasoning-Content: present` header. Streaming emits a single `delta.reasoning_content` chunk before `[DONE]`. Non-standard field follows DeepSeek convention.
-- **Not yet covered.** `tools` + `reasoning_content` are Ollama-only in v0.21.0. vLLM and MLX backends do not yet forward tools to the agent or parse `tool_calls`/`reasoning_content` from the upstream response — requests routed to a non-Ollama node will silently return plain content (no tool_calls). Anthropic `/v1/messages` accepts the schema fields but does not yet plumb tools through. qwen3-thinking `<think>...</think>` blocks (MLX) are a separate gap. Full breakdown in [`.qcoda/api.md`](.qcoda/api.md). Multi-backend tool support is the next minor.
+- **Coverage note.** v0.21.0 wired tools + `reasoning_content` through the OpenAI endpoint + Ollama backend only. The `0.21.2` and `0.21.3` patches below closed the remaining endpoint/backend gaps — see those entries for current coverage.
+
+### `0.21.1` — Unauthenticated `/version` endpoint
+
+- **`GET /version` (unauthenticated, D097).** Returns `{"version": "<APP_VERSION>"}` for fast post-deploy verification (`curl -s https://mesh.qcoda.com/version`) without an API key. `/health` stays version-less per its CVE-targeting comment; version-string enumeration adds no surface beyond what `pip index versions` or GitHub Releases already expose.
+
+### `0.21.2` — Tools serialization fix + symmetric `tool_choice` post-validate
+
+- **Hub→agent serialization now carries `tools`** (D098). The agent-poll entry flattened `prompt`/`messages`/`num_ctx`/`max_tokens` to top level but not `tools`, so the agent read `None` and posted the Ollama request without the schema — the model never saw the tools (`tool_calls:null`). Fixed; closes the qcoda-reported `qwen3-coder:30b` silent drop on `mesh.qcoda.com`.
+- **Named-function `tool_choice` now post-validates** (D098). `tool_choice="required"` already 422'd when no call was emitted; `{type:"function",function:{name:"X"}}` now does too. Enforcement is symmetric — both 422 with `attempted_tools` populated when the model emits no tool call.
+
+### `0.21.3` — Multi-backend + Anthropic-endpoint tool coverage
+
+- **`/v1/messages` (Anthropic endpoint) now forwards `tools` + `tool_choice`** (D099). Previously the Anthropic path accepted the schema fields but never forwarded them to the agent (text-only response, `stop_reason:end_turn`). Now forwards both with the same hub-enforced filter/post-validate as the OpenAI path and emits native Anthropic `tool_use` content blocks (non-streaming + SSE), flipping `stop_reason` to `"tool_use"`.
+- **vLLM + MLX backends now forward tools** (D099). The agent's vLLM/MLX non-streaming path now sends `tools` and parses `tool_calls`/`reasoning_content` from the upstream response — closing the last silent-drop on non-Ollama nodes. `tool_choice` stays hub-enforced (not forwarded), matching the Ollama contract.
+- **Still not covered.** qwen3-thinking `<think>...</think>` blocks (MLX) are a separate gap from gpt-oss harmony. Streaming `tool_call.arguments` arrives as a single synthesized delta (Ollama emits the whole call in one frame), not true per-token incremental deltas. Full breakdown in [`.qcoda/api.md`](.qcoda/api.md).
 
 ## Core Project Components
 
