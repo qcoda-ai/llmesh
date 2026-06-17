@@ -479,6 +479,7 @@ function updateModelDropdown(nodes) {
             ...(n.ollama_available ? (n.ollama_models || []) : []),
             ...(n.vllm_available   ? (n.vllm_models   || []) : []),
             ...(n.mlx_available    ? (n.mlx_models    || []) : []),
+            ...(n.llamacpp_available ? (n.llamacpp_models || []) : []),
         ];
         allModels.forEach(m => counts[m] = (counts[m] || 0) + 1);
     });
@@ -523,7 +524,7 @@ function updateNodeTable(nodes) {
     container.innerHTML = nodes.map((n, idx) => {
         const r = nodeRatings[n.node_id_full] || {};
         const stale = n.last_seen_sec >= 30;
-        const anyUp = n.ollama_available || n.vllm_available || n.mlx_available || n.image_available;
+        const anyUp = n.ollama_available || n.vllm_available || n.mlx_available || n.llamacpp_available || n.image_available;
         const dotClass = stale ? 'stale' : anyUp ? 'online' : 'offline';
         const collapseId = `node-collapse-${idx}`;
 
@@ -554,6 +555,7 @@ function updateNodeTable(nodes) {
                     ${backendRow('Ollama', n.ollama_available, n.ollama_models)}
                     ${backendRow('vLLM',   n.vllm_available,   n.vllm_models)}
                     ${backendRow('MLX',    n.mlx_available,    n.mlx_models)}
+                    ${backendRow('llama.cpp', n.llamacpp_available, n.llamacpp_models)}
                     ${backendRow('Embed',  (n.embedding_models || []).length > 0, n.embedding_models)}
                     ${backendRow('Image',  n.image_available, n.image_models)}
                     <div class="text-muted mt-2" style="font-size:0.78rem">

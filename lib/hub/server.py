@@ -274,7 +274,8 @@ def _node_has_model(n, model: str) -> bool:
         model in getattr(n.resources, "ollama_models", []) or
         model in getattr(n.resources, "embedding_models", []) or
         model in getattr(n.resources, "vllm_models", []) or
-        model in getattr(n.resources, "mlx_models", [])
+        model in getattr(n.resources, "mlx_models", []) or
+        model in getattr(n.resources, "llamacpp_models", [])
     )
 
 
@@ -301,6 +302,7 @@ def _node_is_capable(n) -> bool:
         n.resources.ollama_available or
         getattr(n.resources, "vllm_available", False) or
         getattr(n.resources, "mlx_available", False) or
+        getattr(n.resources, "llamacpp_available", False) or
         getattr(n.resources, "image_available", False)
     )
 
@@ -978,6 +980,7 @@ async def heartbeat(request: Request, node_id: str, req: HeartbeatRequest, _: No
     node.resources.ollama_available = req.ollama_available
     node.resources.vllm_available = req.vllm_available
     node.resources.mlx_available = req.mlx_available
+    node.resources.llamacpp_available = getattr(req, "llamacpp_available", False)
     # D064: image_available toggles per heartbeat (mflux import + model dir
     # state may change between heartbeats — operator installing/removing
     # models). image_models / vram_gb stay sticky from registration; full
@@ -1498,6 +1501,8 @@ async def get_nodes_for_owner(
             "vllm_models": getattr(n.resources, "vllm_models", []),
             "mlx_available": getattr(n.resources, "mlx_available", False),
             "mlx_models": getattr(n.resources, "mlx_models", []),
+            "llamacpp_available": getattr(n.resources, "llamacpp_available", False),
+            "llamacpp_models": getattr(n.resources, "llamacpp_models", []),
             "image_available": getattr(n.resources, "image_available", False),
             "image_models": getattr(n.resources, "image_models", []),
             "agent_version": getattr(n.resources, "agent_version", "0.1x"),
@@ -1622,6 +1627,8 @@ async def list_models(request: Request, authorization: str | None = Header(None)
             _record(m, "chat", per_model.get(m, node_default_ctx))
         for m in getattr(n.resources, "mlx_models", []):
             _record(m, "chat", per_model.get(m, node_default_ctx))
+        for m in getattr(n.resources, "llamacpp_models", []):
+            _record(m, "chat", per_model.get(m, node_default_ctx))
         for m in getattr(n.resources, "embedding_models", []):
             _record(m, "embed", per_model.get(m, node_default_ctx))
 
@@ -1677,7 +1684,7 @@ async def list_limits(request: Request, authorization: str | None = Header(None)
             continue
         node_default_ctx = getattr(n.resources, "context_size", 8192)
         per_model = getattr(n.resources, "model_context", {}) or {}
-        for attr in ("ollama_models", "vllm_models", "mlx_models", "embedding_models"):
+        for attr in ("ollama_models", "vllm_models", "mlx_models", "llamacpp_models", "embedding_models"):
             for m in getattr(n.resources, attr, []) or []:
                 ctx = per_model.get(m, node_default_ctx) or 0
                 if ctx > 0:
@@ -2313,7 +2320,8 @@ async def dashboard_view(request: Request, llmesh_session: str | None = Cookie(N
             chat_models = (
                 getattr(n.resources, "ollama_models", []) +
                 getattr(n.resources, "vllm_models", []) +
-                getattr(n.resources, "mlx_models", [])
+                getattr(n.resources, "mlx_models", []) +
+                getattr(n.resources, "llamacpp_models", [])
             )
             for model in chat_models:
                 model_counts[model] = model_counts.get(model, 0) + 1

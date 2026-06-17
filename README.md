@@ -200,13 +200,14 @@ To start the server:
 
 ### 2. Start an Agent (Node)
 
-Each agent node registers available models with the Hub. **Ollama is enabled by default.** vLLM and MLX are opt-in — set `VLLM_HOST` or `MLX_HOST` to enable them. Three backends are supported:
+Each agent node registers available models with the Hub. **Ollama is enabled by default.** vLLM, MLX, and llama.cpp are opt-in — set `VLLM_HOST`, `MLX_HOST`, or `LLAMACPP_HOST` to enable them. Four backends are supported:
 
 | Backend | Platform | Default port | Detection |
 |---|---|---|---|
 | **Ollama** | Any | `11434` | `GET /` + `GET /api/tags` |
 | **vLLM** | Linux (GPU) | `8000` | `GET /health` + `GET /v1/models` |
 | **MLX** | macOS (Apple Silicon) | `1337` | `GET /` + `GET /v1/models` |
+| **llama.cpp** | Any (CPU/GPU) | `8080` | `GET /health` + `GET /v1/models` |
 
 A node can run any combination of these simultaneously. Models from all active backends are pooled and available for routing.
 
@@ -217,9 +218,10 @@ A node can run any combination of these simultaneously. Models from all active b
 | **Full** | Ollama | Fully supported. Real per-token SSE streaming. Adaptive batching via `StreamBatcher` (D041 + D067). Tested end-to-end. Recommended for all deployments. |
 | **Full** | vLLM | Real per-token SSE streaming, default ON (D040 + D044, verified in LAB-002). GPU/Linux. Auth-protected endpoints via `VLLM_API_KEY` (D014). Context auto-detected from `max_model_len` in `/v1/models` (D015). Forwards client `max_tokens`. LiteLLM Proxy compatibility — see [docs/integrations/litellm.md](docs/integrations/litellm.md). Set `VLLM_STREAMING_ENABLED=false` to revert to the D018 bridge path. |
 | **Full** | MLX | Real per-token SSE streaming, default ON (D059 + D060, verified in LAB-003 against **osaurus** on M1 Ultra). macOS Apple Silicon only. `mlx-lm.server` also compatible. Set `MLX_STREAMING_ENABLED=false` to revert to the D018 bridge path. |
+| **Full** | llama.cpp | `llama-server` OpenAI-compatible endpoint, any platform (CPU/GPU, single binary) — fills the tier where vLLM needs CUDA and Ollama feels heavy (D104). Shares the MLX streaming path (default ON; set `LLAMACPP_STREAMING_ENABLED=false` to revert). Optional bearer auth via `LLAMACPP_API_KEY` (`--api-key`). Inherits qwen tool-call normalization (D101/D102). One `llama-server` instance = one model; multi-instance fan-out deferred to v2. |
 | **BETA** | mflux (image generation) | OpenAI-compatible `POST /v1/images/generations` + dashboard `Image` tab. FLUX-schnell + FLUX-dev on Apple Silicon Macs **only**. **64 GB UMA minimum, no co-resident large MLX/LLM workloads** (D083). Operator-explicit model install (`scripts/install_image_model.py`). See [`docs/image_gen.md`](docs/image_gen.md) — read the stability advisory before enabling. |
 
-All three inference backends (Ollama, vLLM, MLX) share the same adaptive `StreamBatcher` pipeline (D067) — no per-backend streaming divergence as of v0.20.0.
+All inference backends (Ollama, vLLM, MLX, llama.cpp) share the same adaptive `StreamBatcher` pipeline (D067) — no per-backend streaming divergence. MLX and llama.cpp share a single OpenAI-SSE streaming implementation (D104).
 
 Configure the agent to authenticate with the Hub using your API key. You can set it up in two ways:
 
@@ -247,6 +249,10 @@ LLMesh includes a cross-platform system tray application that runs the agent pur
 > | `VLLM_MAX_CONTEXT` | _(auto-detect)_ | Optional explicit override for the vLLM context window the agent reports to the hub. By default the agent auto-detects this from `max_model_len` in vLLM's `/v1/models` response. Set this when running behind a proxy that strips the field, or to clamp the advertised window below the model's actual capability. |
 > | `VLLM_STREAMING_ENABLED` | `true` | Master gate for vLLM real per-token streaming (D040 implementation, default flipped ON in D044 after operator verification). Set to `false` to fall back to the blocking + D018 bridge path (single-frame SSE delivery). |
 > | `MLX_HOST` | _(disabled)_ | Base URL for a local MLX server. Set to enable MLX backend. |
+> | `LLAMACPP_HOST` | _(disabled)_ | Base URL for a llama.cpp `llama-server` (OpenAI-compatible). Set to enable the llama.cpp backend. One instance serves one model. |
+> | `LLAMACPP_HEALTH_PATH` | `/health` | Path the agent probes for llama-server liveness. `/` serves llama-server's web UI, not a liveness probe — keep the default unless your reverse proxy exposes a different health route. |
+> | `LLAMACPP_API_KEY` | _(none)_ | Optional bearer token for `llama-server` started with `--api-key`. Plain local llama-server does not need this. |
+> | `LLAMACPP_STREAMING_ENABLED` | `true` | Master gate for llama.cpp real per-token streaming (shares the MLX SSE path, D104). Set to `false` to fall back to the blocking + D018 bridge path. |
 > | `OLLAMA_PARALLEL_SLOTS` | _(auto)_ | Override auto-detected concurrent inference slot count |
 > | `STREAM_BATCH_FIXED` | _(unset)_ | Pin the agent's stream-batch size to a fixed N and disable adaptive auto-tune. Useful for load testing (`=1`), debug (`=1`), conservative production (`=20`), or pre-characterized fast clusters (`=50`). See `STREAM_BATCH_*` in `.env.example` and decisions.md D041 for the full set of adaptive batching tunables (`STREAM_BATCH_INITIAL`, `STREAM_BATCH_TIME_MS`, `STREAM_BATCH_TARGET_PPS`, `STREAM_BATCH_MIN`, `STREAM_BATCH_MAX`, `STREAM_BATCH_MAX_BUFFER`). |
 
@@ -286,6 +292,20 @@ Any OpenAI-compatible MLX server (e.g. osaurus) on port `1337` by default. The a
 ```bash
 MLX_HOST=http://localhost:1337 LLMESH_API_KEY="..." python -m lib.agent.client
 ```
+
+**llama.cpp (any platform)**
+
+Any `llama-server` instance (OpenAI-compatible, default port `8080`). The agent probes `GET /health` for liveness and `GET /v1/models` to list the loaded model. One `llama-server` process loads exactly one model. llama.cpp is only enabled when `LLAMACPP_HOST` is set:
+
+```bash
+# start llama-server (loads one GGUF model)
+llama-server -m ./model.gguf --host 0.0.0.0 --port 8080
+
+# point the agent at it
+LLAMACPP_HOST=http://localhost:8080 LLMESH_API_KEY="..." python -m lib.agent.client
+```
+
+For an authenticated `llama-server` (started with `--api-key`), set `LLAMACPP_API_KEY` to attach the bearer token.
 
 ### 3. Optional: Session Memory & Configuration
 

@@ -262,7 +262,7 @@ async def test_streaming_non_200_open_emits_error_and_done(patch_hosts):
             {"task_id": "m7", "model": "m1", "messages": []},
         )
     assert len(posts["stream_posts"]) == 2
-    assert "MLX stream open failed: 503" in posts["stream_posts"][0]["chunk"]
+    assert "mlx stream open failed: 503" in posts["stream_posts"][0]["chunk"]
     assert posts["stream_posts"][1]["done"] is True
     assert len(posts["complete_posts"]) == 0
 
@@ -329,7 +329,7 @@ async def test_streaming_warns_when_num_ctx_set(patch_hosts, caplog):
             {"task_id": "m10", "model": "m1", "messages": [], "num_ctx": 8192},
         )
     messages = [r.getMessage() for r in caplog.records]
-    assert any("num_ctx=8192 ignored on MLX" in m for m in messages), messages
+    assert any("num_ctx=8192 ignored on mlx" in m for m in messages), messages
 
 
 # --- 11. MLX_STREAMING_ENABLED default ON per D060 ---------------------------

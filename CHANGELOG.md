@@ -12,6 +12,19 @@ _Nothing yet._
 
 ---
 
+## [0.22.0] — 2026-06-17 — llama.cpp `llama-server` backend
+
+Minor. New inference backend (additive, backward-compatible).
+
+### Added
+- **llama.cpp `llama-server` as a fourth inference backend** (D104). OpenAI-compatible (`/v1/chat/completions` + `/v1/models`), opt-in via `LLAMACPP_HOST`. Fills the CPU/cross-platform/single-binary tier where vLLM needs CUDA and Ollama feels heavy. New env: `LLAMACPP_HOST`, `LLAMACPP_HEALTH_PATH` (default `/health`), optional `LLAMACPP_API_KEY` (bearer, for `--api-key` deployments), `LLAMACPP_STREAMING_ENABLED` (default ON). Inherits qwen text-form tool-call normalization (D101/D102). One `llama-server` instance serves one model; multi-instance fan-out deferred to v2.
+
+### Changed
+- **MLX and llama.cpp now share one streaming implementation** (`_run_streaming_openai`, D104) — `_run_streaming_mlx` generalized; no duplicated SSE path added. The vLLM streaming path is unchanged (it carries the `include_usage` probe + auth quirks).
+- Hub `ResourceCaps`/`HeartbeatRequest` gain additive `llamacpp_available`/`llamacpp_models` fields; dashboard shows a `llama.cpp` backend row.
+
+---
+
 ## [0.21.6] — 2026-06-17 — Friendly OS labels on the dashboard
 
 Patch. Cosmetic.

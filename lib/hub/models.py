@@ -20,6 +20,10 @@ class ResourceCaps(BaseModel):
     vllm_models: list[str] = []
     mlx_available: bool = False
     mlx_models: list[str] = []
+    # llama.cpp `llama-server` backend (D104). OpenAI-compatible, wire-identical
+    # to MLX. Additive: pre-D104 agents omit these fields → defaults apply.
+    llamacpp_available: bool = False
+    llamacpp_models: list[str] = []
     parallel_slots: int = 1
     streaming_capable: bool = False
     context_size: int = 8192
@@ -73,6 +77,7 @@ class HeartbeatRequest(BaseModel):
     ollama_available: bool
     vllm_available: bool = False
     mlx_available: bool = False
+    llamacpp_available: bool = False
     image_available: bool = False
     cpu_load: float = 0.0
     latency_ms: float = 0.0

@@ -79,6 +79,17 @@ MLX_HOST = os.getenv("MLX_HOST")              # None unless explicitly set
 # parity + client-disconnect 410 cancel all observed). Set to "false" / "0" /
 # "no" to fall back to the blocking + D018 bridge path.
 MLX_STREAMING_ENABLED = os.getenv("MLX_STREAMING_ENABLED", "true").lower() in ("true", "1", "yes")
+# llama.cpp `llama-server` backend (D104). Wire-identical to the MLX/osaurus
+# path — OpenAI-compatible `/v1/chat/completions` + `/v1/models`. Differences
+# captured at the call sites: health probe defaults to `/health` (llama-server's
+# liveness endpoint; `/` serves the web UI), and bearer auth is optional via
+# `LLAMACPP_API_KEY` for deployments started with `--api-key`. One llama-server
+# instance loads exactly one model, so a single LLAMACPP_HOST advertises whatever
+# `/v1/models` returns (typically one id). Multi-instance fan-out deferred to v2.
+LLAMACPP_HOST = os.getenv("LLAMACPP_HOST")              # None unless explicitly set
+LLAMACPP_HEALTH_PATH = os.getenv("LLAMACPP_HEALTH_PATH", "/health")
+LLAMACPP_API_KEY = os.getenv("LLAMACPP_API_KEY", "")
+LLAMACPP_STREAMING_ENABLED = os.getenv("LLAMACPP_STREAMING_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # D066: process-level state for vLLM `stream_options.include_usage` support.
 # vLLM versions older than ~0.4.1 (and proxies that strip stream_options) silently
@@ -113,6 +124,14 @@ class _StreamCancelled(Exception):
 def _vllm_headers() -> dict:
     """Bearer-auth header for vLLM-path requests, or empty if no key set."""
     return {"Authorization": f"Bearer {VLLM_API_KEY}"} if VLLM_API_KEY else {}
+
+
+def _llamacpp_headers() -> dict:
+    """Bearer-auth header for llama-server requests, or empty if no key set (D104).
+
+    llama-server gates `/v1/*` only when started with `--api-key`; most local
+    deployments run unauthenticated. Mirrors `_vllm_headers()`."""
+    return {"Authorization": f"Bearer {LLAMACPP_API_KEY}"} if LLAMACPP_API_KEY else {}
 
 
 async def _iter_sse_events(byte_stream):
@@ -388,6 +407,35 @@ def get_mlx_models() -> list[str]:
         logger.warning("MLX model listing failed: %s", e)
     return []
 
+def check_llamacpp_available() -> bool:
+    if not LLAMACPP_HOST:
+        return False
+    try:
+        resp = httpx.get(
+            f"{LLAMACPP_HOST}{LLAMACPP_HEALTH_PATH}",
+            timeout=2.0, headers=_llamacpp_headers(),
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+def get_llamacpp_models() -> list[str]:
+    if not LLAMACPP_HOST:
+        return []
+    try:
+        resp = httpx.get(
+            f"{LLAMACPP_HOST}/v1/models",
+            timeout=2.0, headers=_llamacpp_headers(),
+        )
+        if resp.status_code == 200:
+            models = [m["id"] for m in resp.json().get("data", [])]
+            logger.info("llama.cpp models found: %s", models)
+            return models
+        logger.warning("llama.cpp /v1/models returned %s", resp.status_code)
+    except Exception as e:
+        logger.warning("llama.cpp model listing failed: %s", e)
+    return []
+
 def compute_safe_parallel_slots() -> int:
     """
     Detect how many concurrent Ollama inference slots this machine can safely run.
@@ -511,6 +559,8 @@ def gather_resources() -> dict:
     vllm_max_context = VLLM_MAX_CONTEXT or vllm_detected_ctx
     mlx_up = check_mlx_available()
     mlx_models = get_mlx_models() if mlx_up else []
+    llamacpp_up = check_llamacpp_available()
+    llamacpp_models = get_llamacpp_models() if llamacpp_up else []
     slots = compute_safe_parallel_slots()
     context_size = _resolve_node_context_size(
         ollama_active=len(raw_ollama) > 0,
@@ -529,7 +579,7 @@ def gather_resources() -> dict:
     if vllm_max_context:
         for m in vllm_models:
             model_context[m] = vllm_max_context
-    # MLX does not expose per-model context; leave to fallback.
+    # MLX and llama.cpp do not expose per-model context; leave to fallback.
 
     if vllm_up:
         if vllm_max_context:
@@ -561,6 +611,8 @@ def gather_resources() -> dict:
         "vllm_models": vllm_models,
         "mlx_available": mlx_up,
         "mlx_models": mlx_models,
+        "llamacpp_available": llamacpp_up,
+        "llamacpp_models": llamacpp_models,
         "image_available": image_available,
         "image_models": image_models,
         "vram_gb": vram_gb,
@@ -580,6 +632,7 @@ class AppState:
         self.parallel_slots = 1  # updated after registration with the detected value
         self.vllm_models: list = []
         self.mlx_models: list = []
+        self.llamacpp_models: list = []
         self.embedding_models: list = []
         self.model_context: dict = {}
 
@@ -588,6 +641,7 @@ async def register_with_hub(state: AppState):
     state.parallel_slots = resources["parallel_slots"]
     state.vllm_models = resources["vllm_models"]
     state.mlx_models = resources["mlx_models"]
+    state.llamacpp_models = resources["llamacpp_models"]
     state.embedding_models = resources["embedding_models"]
     state.model_context = resources["model_context"]
     logger.info("Gathered local resources: %s", resources)
@@ -621,6 +675,7 @@ async def heartbeat_loop(state: AppState):
     prev_ollama = None
     prev_vllm = None
     prev_mlx = None
+    prev_llamacpp = None
     prev_image = None
 
     while True:
@@ -638,6 +693,7 @@ async def heartbeat_loop(state: AppState):
             ollama_up = check_ollama_available() and not_overloaded
             vllm_up = check_vllm_available() and not_overloaded
             mlx_up = check_mlx_available() and not_overloaded
+            llamacpp_up = check_llamacpp_available() and not_overloaded
 
             # D064: image_available toggles per heartbeat — mflux import +
             # installed-model state may change while agent runs.
@@ -645,18 +701,20 @@ async def heartbeat_loop(state: AppState):
 
             # Re-register when any backend transitions back to available — refreshes model lists
             if prev_ollama is not None:
-                if (ollama_up and not prev_ollama) or (vllm_up and not prev_vllm) or (mlx_up and not prev_mlx) or (image_up_h and not prev_image):
+                if (ollama_up and not prev_ollama) or (vllm_up and not prev_vllm) or (mlx_up and not prev_mlx) or (llamacpp_up and not prev_llamacpp) or (image_up_h and not prev_image):
                     logger.info("🔄 Backend came back online — refreshing registration...")
                     await register_with_hub(state)
 
             prev_ollama = ollama_up
             prev_vllm = vllm_up
             prev_mlx = mlx_up
+            prev_llamacpp = llamacpp_up
             prev_image = image_up_h
             payload = {
                 "ollama_available": ollama_up,
                 "vllm_available": vllm_up,
                 "mlx_available": mlx_up,
+                "llamacpp_available": llamacpp_up,
                 "image_available": image_up_h,
                 "cpu_load": cpu_load,
                 "latency_ms": round(last_latency_ms, 2)
@@ -1135,17 +1193,25 @@ async def _run_streaming_vllm(client: httpx.AsyncClient, state: AppState, task: 
         await batcher.close()
 
 
-async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: dict):
-    """Stream MLX inference token-by-token, batching POSTs to the hub (D059).
+async def _run_streaming_openai(client: httpx.AsyncClient, state: AppState, task: dict,
+                                *, host: str, backend_name: str,
+                                backend_headers: dict | None = None):
+    """Stream a no-/optional-auth OpenAI-compatible backend token-by-token (D059).
+
+    Shared by the MLX/osaurus path and the llama.cpp `llama-server` path (D104):
+    both speak OpenAI-shaped SSE on `/v1/chat/completions` and neither emits a
+    `usage` chunk by default, so token accounting falls through to HP-1
+    estimation identically. The vLLM path (`_run_streaming_vllm`) stays separate
+    — it carries the `stream_options.include_usage` capability probe and bearer
+    auth quirks that don't apply here. `backend_headers` injects optional bearer
+    auth (llama-server `--api-key`); MLX passes none.
 
     MLX servers in scope: `osaurus` (Apache 2.0 Swift implementation, primary
-    target) and `mlx-lm.server` (Python reference). Both speak OpenAI-shaped
-    SSE on `/v1/chat/completions`.
+    target) and `mlx-lm.server` (Python reference).
 
-    Differences from the vLLM path (`_run_streaming_vllm`):
-    - **No auth header.** Local MLX servers do not gate `/v1/chat/completions`;
-      `_vllm_headers()` is not used here. If a future deployment wants bearer
-      auth, lift the env-var pattern from `VLLM_API_KEY` then.
+    Backend-specific notes:
+    - **Auth.** Local MLX servers do not gate `/v1/chat/completions`; llama-server
+      gates it only when started with `--api-key`. `backend_headers` covers both.
     - **No `usage` chunk emitted by osaurus** even with
       `stream_options.include_usage=true` (verified against osaurus 2026-05-28).
       Token accounting always falls through to the HP-1 estimation path
@@ -1188,11 +1254,11 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
 
     if task.get("num_ctx"):
         logger.warning(
-            "⚠️  [%s] num_ctx=%s ignored on MLX — context fixed at server startup (parallels D015)",
-            task_id, task.get("num_ctx"),
+            "⚠️  [%s] num_ctx=%s ignored on %s — context fixed at server startup (parallels D015)",
+            task_id, task.get("num_ctx"), backend_name,
         )
 
-    logger.info("⚙️  [%s] STREAMING via mlx (%s)...", task_id, model)
+    logger.info("⚙️  [%s] STREAMING via %s (%s)...", task_id, backend_name, model)
 
     cancelled = False
     pt = ct = 0
@@ -1232,12 +1298,12 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
 
     try:
         async with client.stream(
-            "POST", f"{MLX_HOST}/v1/chat/completions",
-            json=payload, timeout=600.0,
+            "POST", f"{host}/v1/chat/completions",
+            json=payload, timeout=600.0, headers=backend_headers or {},
         ) as resp:
             if resp.status_code != 200:
                 err_bytes = await resp.aread()
-                err_text = f"MLX stream open failed: {resp.status_code} - {err_bytes.decode(errors='replace')[:200]}"
+                err_text = f"{backend_name} stream open failed: {resp.status_code} - {err_bytes.decode(errors='replace')[:200]}"
                 logger.error("❌ [%s] %s", task_id, err_text)
                 await _post_chunk(err_text, done=False)
                 await _post_chunk("", done=True)
@@ -1254,9 +1320,9 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
                     continue
                 if "error" in evt:
                     err_msg = json.dumps(evt["error"])
-                    logger.error("❌ [%s] MLX error frame: %s", task_id, err_msg)
+                    logger.error("❌ [%s] %s error frame: %s", task_id, backend_name, err_msg)
                     await batcher.flush(done=False)
-                    await _post_chunk(f"\n[MLX error: {err_msg}]", done=False)
+                    await _post_chunk(f"\n[{backend_name} error: {err_msg}]", done=False)
                     break
                 if evt.get("usage"):
                     u = evt["usage"]
@@ -1279,8 +1345,8 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
         # this branch is skipped.
         if pt == 0 and ct == 0 and delta_count > 0:
             logger.info(
-                "ℹ️  [%s] MLX did not emit usage chunk — estimating tokens_c=%s from delta count",
-                task_id, delta_count,
+                "ℹ️  [%s] %s did not emit usage chunk — estimating tokens_c=%s from delta count",
+                task_id, backend_name, delta_count,
             )
             ct = delta_count
         # D068: capture batcher telemetry just before the final flush.
@@ -1292,8 +1358,8 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
                             stream_batches=_stream_batches_total,
                             stream_final_size=_stream_final_size)
         logger.info(
-            "✅ [%s] MLX stream complete. P:%s C:%s finish=%s batches=%s final_size=%s",
-            task_id, pt, ct, finish_reason,
+            "✅ [%s] %s stream complete. P:%s C:%s finish=%s batches=%s final_size=%s",
+            task_id, backend_name, pt, ct, finish_reason,
             batcher.stats['flushes'], batcher.current_size,
         )
 
@@ -1307,14 +1373,14 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
         except Exception:
             pass
     except (httpx.ReadTimeout, httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.error("❌ [%s] MLX stream interrupted: %s", task_id, e)
+        logger.error("❌ [%s] %s stream interrupted: %s", task_id, backend_name, e)
         try:
             await _post_chunk(f"\n[Stream interrupted: {e}]", done=False)
             await _post_chunk("", done=True, prompt_tokens=pt, completion_tokens=delta_count or ct)
         except Exception:
             pass
     except Exception as e:
-        logger.error("❌ [%s] Unexpected error in MLX stream: %s", task_id, e)
+        logger.error("❌ [%s] Unexpected error in %s stream: %s", task_id, backend_name, e)
         try:
             await _post_chunk(f"\n[Stream error: {e}]", done=False)
             await _post_chunk("", done=True, prompt_tokens=pt, completion_tokens=delta_count or ct)
@@ -1322,6 +1388,21 @@ async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: d
             pass
     finally:
         await batcher.close()
+
+
+async def _run_streaming_mlx(client: httpx.AsyncClient, state: AppState, task: dict):
+    """MLX/osaurus streaming — thin wrapper over the shared OpenAI SSE path (D104)."""
+    await _run_streaming_openai(
+        client, state, task, host=MLX_HOST, backend_name="mlx",
+    )
+
+
+async def _run_streaming_llamacpp(client: httpx.AsyncClient, state: AppState, task: dict):
+    """llama.cpp `llama-server` streaming — shared OpenAI SSE path + optional auth (D104)."""
+    await _run_streaming_openai(
+        client, state, task, host=LLAMACPP_HOST, backend_name="llamacpp",
+        backend_headers=_llamacpp_headers(),
+    )
 
 
 async def _run_embedding_ollama(client: httpx.AsyncClient, state: AppState, task: dict):
@@ -1462,6 +1543,9 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
     elif model_to_use in state.mlx_models:
         backend = "mlx"
         base_url = MLX_HOST
+    elif model_to_use in state.llamacpp_models:
+        backend = "llamacpp"
+        base_url = LLAMACPP_HOST
     else:
         backend = "ollama"
         base_url = None
@@ -1482,11 +1566,16 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
         elif backend == "mlx" and MLX_STREAMING_ENABLED:
             await _run_streaming_mlx(client, state, task)
             return
+        elif backend == "llamacpp" and LLAMACPP_STREAMING_ENABLED:
+            await _run_streaming_llamacpp(client, state, task)
+            return
         else:
             if backend == "vllm":
                 reason = f"vllm streaming disabled (VLLM_STREAMING_ENABLED={VLLM_STREAMING_ENABLED})"
             elif backend == "mlx":
                 reason = f"mlx streaming disabled (MLX_STREAMING_ENABLED={MLX_STREAMING_ENABLED})"
+            elif backend == "llamacpp":
+                reason = f"llamacpp streaming disabled (LLAMACPP_STREAMING_ENABLED={LLAMACPP_STREAMING_ENABLED})"
             else:
                 reason = f"{backend} streaming not implemented"
             logger.warning(
@@ -1501,8 +1590,8 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
     reasoning_content = ""
 
     try:
-        if backend in ("vllm", "mlx"):
-            # OpenAI-compatible path — both vLLM and MLX use /v1/chat/completions
+        if backend in ("vllm", "mlx", "llamacpp"):
+            # OpenAI-compatible path — vLLM, MLX, and llama.cpp (D104) all use /v1/chat/completions
             if not messages:
                 messages = [{"role": "user", "content": task.get("prompt", "")}]
             logger.info("⚙️  [%s] CHAT via %s (%s)...", task_id, backend, model_to_use)
@@ -1522,10 +1611,16 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
             # the Ollama path's contract — so it is intentionally not forwarded.
             if task.get("tools"):
                 req_body["tools"] = task["tools"]
+            if backend == "vllm":
+                oai_headers = _vllm_headers()
+            elif backend == "llamacpp":
+                oai_headers = _llamacpp_headers()
+            else:
+                oai_headers = {}
             resp = await client.post(
                 f"{base_url}/v1/chat/completions",
                 json=req_body,
-                headers=_vllm_headers() if backend == "vllm" else {},
+                headers=oai_headers,
             )
             if resp.status_code == 200:
                 data = resp.json()
