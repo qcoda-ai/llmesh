@@ -587,6 +587,147 @@ def test_anthropic_sse_emits_tool_use_blocks():
     assert '"stop_reason": "tool_use"' in out
 
 
+# --- D105: /v1/messages accepts Anthropic content-block arrays ---
+
+
+class _Msg:
+    """Minimal stand-in for AnthropicMessage (role + content attrs)."""
+    def __init__(self, role, content):
+        self.role = role
+        self.content = content
+
+
+def test_anthropic_wire_string_content_passthrough():
+    """Gate C — plain string content is untouched (no regression)."""
+    out = server._anthropic_messages_to_wire([_Msg("user", "hello")])
+    assert out == [{"role": "user", "content": "hello"}]
+
+
+def test_anthropic_wire_text_blocks_concatenate():
+    """Claude Code's real shape: a list of text blocks (with cache_control) —
+    flatten to a single content string, ignoring cache_control."""
+    out = server._anthropic_messages_to_wire([_Msg("user", [
+        {"type": "text", "text": "<system-reminder>x</system-reminder>"},
+        {"type": "text", "text": "add a goodbye() function",
+         "cache_control": {"type": "ephemeral"}},
+    ])])
+    assert out == [{"role": "user",
+                    "content": "<system-reminder>x</system-reminder>\nadd a goodbye() function"}]
+
+
+def test_anthropic_wire_tool_use_becomes_openai_tool_calls():
+    out = server._anthropic_messages_to_wire([_Msg("assistant", [
+        {"type": "text", "text": "calling"},
+        {"type": "tool_use", "id": "toolu_1", "name": "edit",
+         "input": {"path": "a.py"}},
+    ])])
+    assert len(out) == 1
+    msg = out[0]
+    assert msg["role"] == "assistant" and msg["content"] == "calling"
+    tc = msg["tool_calls"][0]
+    assert tc["id"] == "toolu_1" and tc["type"] == "function"
+    assert tc["function"]["name"] == "edit"
+    assert json.loads(tc["function"]["arguments"]) == {"path": "a.py"}
+
+
+def test_anthropic_wire_tool_result_becomes_tool_message():
+    """A user turn carrying a tool_result block → standalone {role:tool,...}."""
+    out = server._anthropic_messages_to_wire([_Msg("user", [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "content": [{"type": "text", "text": "done"}]},
+        {"type": "text", "text": "now do the next thing"},
+    ])])
+    # tool result first, then the user text turn
+    assert out[0] == {"role": "tool", "tool_call_id": "toolu_1", "content": "done"}
+    assert out[1] == {"role": "user", "content": "now do the next thing"}
+
+
+def test_anthropic_wire_tool_result_is_error_prefixed():
+    out = server._anthropic_messages_to_wire([_Msg("user", [
+        {"type": "tool_result", "tool_use_id": "t2",
+         "content": "boom", "is_error": True},
+    ])])
+    assert out == [{"role": "tool", "tool_call_id": "t2", "content": "[error] boom"}]
+
+
+def test_anthropic_wire_unknown_block_skipped_not_rejected():
+    """Forward-compat — image/future block types are dropped, never 422."""
+    out = server._anthropic_messages_to_wire([_Msg("user", [
+        {"type": "image", "source": {"type": "base64", "data": "..."}},
+        {"type": "text", "text": "what is this"},
+    ])])
+    assert out == [{"role": "user", "content": "what is this"}]
+
+
+def test_anthropic_messages_block_array_returns_200_not_422(client, monkeypatch):
+    """Gate A — the exact Claude Code repro (block-array content, cache_control)
+    must reach inference and return 200, not 422."""
+    _install_fake_route(monkeypatch, result="ok")
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "qwen2.5-coder:32b", "max_tokens": 256,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>ctx</system-reminder>"},
+            {"type": "text", "text": "add a goodbye() function",
+             "cache_control": {"type": "ephemeral"}},
+        ]}],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["content"] == [{"type": "text", "text": "ok"}]
+
+
+def test_anthropic_messages_string_content_still_200(client, monkeypatch):
+    """Gate C — string content path unchanged."""
+    _install_fake_route(monkeypatch, result="ok")
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "qwen2.5-coder:32b", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plain string"}],
+    })
+    assert resp.status_code == 200, resp.text
+
+
+def test_anthropic_messages_tool_result_turn_accepted(client, monkeypatch):
+    """Gate D — a request carrying a prior tool_result block is accepted and the
+    model can continue the loop (round 200, not 422)."""
+    captured = {}
+
+    async def _capturing_route(req, stream=False):
+        captured["messages"] = req.messages
+        from lib.hub import tasks as ht
+        task = ht.Task(task_id="t-d105", kind=ht.TaskKind.CHAT, model=req.model,
+                       owner_id=req.owner_id, messages=req.messages)
+        task.status = "completed"
+        task.result = "continued"
+        task.done_event.set()
+        ht._task_index[task.task_id] = task
+        ht._node_tasks.setdefault("fake-node", []).append(task)
+        return server.TaskResponse(task_id=task.task_id, node_assigned="fake-node",
+                                   status="completed", model=req.model)
+
+    from lib.hub import storage as _storage
+    monkeypatch.setattr(server, "OPENAI_TOOLS_ENABLED", True)
+    monkeypatch.setattr(_storage, "authenticate_owner",
+                        lambda k: "o" if k == "my_secret_key_1" else None)
+    monkeypatch.setattr(server, "_route_inference", _capturing_route)
+
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "qwen2.5-coder:32b", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "edit the file"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_9", "name": "edit",
+                 "input": {"path": "x.py"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_9", "content": "saved"}]},
+        ],
+    })
+    assert resp.status_code == 200, resp.text
+    wire = captured["messages"]
+    # assistant tool_calls turn + tool-result turn survive the translation
+    assert any(m.get("tool_calls") for m in wire), wire
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "toolu_9"
+               for m in wire), wire
+
+
 # (b) agent vLLM/MLX path forwards tools + parses tool_calls (real dispatch)
 
 def test_agent_mlx_path_forwards_tools_and_parses_tool_calls(monkeypatch):

@@ -188,8 +188,16 @@ class TaskResponse(BaseModel):
 
 # Anthropic API Models
 class AnthropicMessage(BaseModel):
+    # D105 — content is `str | list[block]` per the Anthropic Messages API.
+    # Real Anthropic clients (Claude Code, Claude Desktop, the SDK) ALWAYS send
+    # the block-array form (text / image / tool_use / tool_result, each block
+    # optionally carrying cache_control). The old `content: str` schema 422'd
+    # every such request before inference. Blocks are admitted as opaque dicts
+    # (no per-block schema) so unknown/future block types pass through instead
+    # of failing validation; translation to the upstream wire shape happens in
+    # `_anthropic_messages_to_wire`. cache_control is accepted and ignored.
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]]
 
 class AnthropicRequest(BaseModel):
     model: str
@@ -608,6 +616,94 @@ def _format_tool_calls_for_anthropic(tool_calls: list[dict]) -> list[dict]:
             "input": args,
         })
     return out
+
+
+def _anthropic_block_text(content) -> str:
+    """Flatten an Anthropic content value (str | list[block]) to plain text.
+
+    `tool_result.content` is itself either a string or a list of blocks, so
+    this is reused for both message content and tool-result content. Only
+    `text` blocks contribute; non-text blocks (image, etc.) are dropped from
+    the flattened string.
+    """
+    if isinstance(content, list):
+        return "\n".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return content or ""
+
+
+def _anthropic_messages_to_wire(messages: list) -> list[dict]:
+    """D105 — translate inbound Anthropic content-block messages to the OpenAI
+    wire shape the agent/inference path already consumes.
+
+    Per block type (cache_control on any block is ignored, never rejected):
+      - text         → concatenated into the message `content` string, in order.
+      - tool_use     → OpenAI assistant `tool_calls[]` entry: `{id, type:"function",
+                       function:{name, arguments:<json string>}}` (input object is
+                       JSON-stringified to match the wire shape; the agent's
+                       `_normalize_tool_call_args_for_ollama` re-parses for Ollama).
+      - tool_result  → its own `{role:"tool", tool_call_id, content}` message
+                       (OpenAI requires tool results as separate turns, immediately
+                       after the assistant tool_calls turn). `is_error` is surfaced
+                       as a prefix so the model still sees failure signal.
+      - other/unknown → skipped (forward-compat; never 422).
+
+    A string `content` passes through untouched (regression-safe — gate C).
+    """
+    wire: list[dict] = []
+    for m in messages:
+        role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None)
+        content = getattr(m, "content", None)
+        if content is None and isinstance(m, dict):
+            content = m.get("content")
+
+        if not isinstance(content, list):
+            wire.append({"role": role, "content": content or ""})
+            continue
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        tool_results: list[dict] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(block.get("text", "") or "")
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": json.dumps(block.get("input") or {}),
+                    },
+                })
+            elif btype == "tool_result":
+                body = _anthropic_block_text(block.get("content"))
+                if block.get("is_error"):
+                    body = f"[error] {body}"
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id", ""),
+                    "content": body,
+                })
+            # unknown block types (image, future) are skipped for forward-compat
+
+        # tool_result turns become standalone tool messages (must precede any
+        # trailing user text so the OpenAI ordering invariant holds).
+        wire.extend(tool_results)
+
+        joined = "\n".join(p for p in text_parts if p)
+        if tool_calls:
+            # assistant turn carrying tool calls — content may be empty.
+            wire.append({"role": role, "content": joined, "tool_calls": tool_calls})
+        elif joined or not tool_results:
+            # plain text turn, OR an empty turn with no tool_results to stand in.
+            wire.append({"role": role, "content": joined})
+    return wire
 
 
 def _sse_event(event_name: str, data: dict) -> str:
@@ -1965,7 +2061,13 @@ async def anthropic_messages(
             }},
         )
 
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    # D105 — translate Anthropic content-block messages (str | list[block]) to
+    # the OpenAI wire shape. The old `[{role, content: m.content}]` passed block
+    # arrays through raw, which the agent path can't consume (it expects string
+    # content + OpenAI-shape tool_calls / tool messages). text blocks flatten,
+    # tool_use/tool_result map to the agentic-loop wire shape, cache_control is
+    # ignored. String content is untouched (no regression on plain requests).
+    messages = _anthropic_messages_to_wire(req.messages)
     # D099 — forward tools/tool_choice through the same hub-enforced pipeline as
     # the OpenAI endpoint. Previously dropped here: the model never saw the tool
     # schema, so /v1/messages silently emitted 0 tool calls (same bug class as

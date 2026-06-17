@@ -12,6 +12,13 @@ _Nothing yet._
 
 ---
 
+## [0.22.1] — 2026-06-17 — `/v1/messages` accepts Anthropic content-block arrays
+
+### Fixed
+- **`/v1/messages` no longer 422s real Anthropic clients (D105).** `messages[].content` now accepts the Anthropic content-block array form (`text` / `image` / `tool_use` / `tool_result`, with optional `cache_control`) in addition to a plain string. Claude Code, Claude Desktop, Chatwise, and the `anthropic` SDK always send the block-array form; the old `content: str` schema rejected every such request with HTTP 422 before inference. Inbound blocks are translated to the OpenAI wire shape (text concatenated; `tool_use` → assistant `tool_calls`; `tool_result` → `{role:"tool",…}`); unknown block types are skipped (forward-compat) and `cache_control` is ignored. Plain-string requests are unchanged. Unblocks pointing any Anthropic-API client at the mesh via `ANTHROPIC_BASE_URL`. (`lib/hub/server.py`)
+
+---
+
 ## [0.22.0] — 2026-06-17 — llama.cpp `llama-server` backend
 
 Minor. New inference backend (additive, backward-compatible).
