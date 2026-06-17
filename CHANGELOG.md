@@ -12,6 +12,33 @@ _Nothing yet._
 
 ---
 
+## [0.21.6] — 2026-06-17 — Friendly OS labels on the dashboard
+
+Patch. Cosmetic.
+
+### Changed
+- **Dashboard node badge shows `macOS` instead of the raw `Darwin`** (D103). Maps `platform.system()` values at the display layer (`Linux`/`Windows` pass through; unknowns verbatim). Raw `os_name` is unchanged in the DB and JSON API for machine consumers.
+
+## [0.21.5] — 2026-06-17 — Extend qwen tool-call normalizer to the vLLM/MLX non-stream path
+
+Patch. Closes the lone remaining hole in D101: `qwen2.5-coder-7b` is **vLLM-served** and leaks its tool call as TEXT in `message.content` (`tool_calls=[]`, `finish_reason=stop`), but the agent's vLLM/MLX **non-stream** branch read `tool_calls` straight from the backend and skipped normalization — unlike the ollama branch and the vLLM *streaming* branch, which already normalized (D102).
+
+### Fixed
+- **qwen2.5-coder tool calls on vLLM/MLX (non-stream) now execute for strict clients** (D102). The agent now applies the same D101 guard + parser to the OpenAI-compatible non-stream response, so text-form calls (observed live as non-deterministic `json` / `<json>` / `<response>` wrappers, all JSON-bearing) are parsed into structured `tool_calls`. The server-config alternative (`--tool-call-parser hermes`) was rejected on evidence: vLLM #29192 confirms `hermes` does not parse the Qwen2.5-**Coder** variant, and prod runs an older vLLM (old-hardware support). Idempotent — no-ops if the vLLM server is ever upgraded to parse natively. Guards unchanged: only fires when tools were requested, no native call present, content non-empty.
+
+## [0.21.4] — 2026-06-16 — Normalize qwen text-form tool calls (ollama) at the agent
+
+Patch. Graduates the qcoda dev-time tool-call proxy's parse rules into nodemesh's serving path (D101). The **response-in** sibling of D098 (which made `tools` *reach* the model).
+
+### Fixed
+- **qwen-family tool calls on ollama now execute for strict clients** (D101). ollama leaves `qwen2.5-coder` tool calls as TEXT in `message.content` (a JSON object) with `tool_calls=[]`, so clients that only run structured `tool_calls` (pi, goose, opencode, MCP via Claude Desktop / Chatwise) silently no-op. The agent now parses the text-form call out of `content` and injects a structured `tool_calls` array — both non-streaming and streaming (`qwen2.5-coder` leaks its JSON into streamed content; verified ollama 0.30.8). The hub's existing OpenAI/Anthropic tool-call shaping then works unchanged for both `/v1/chat/completions` and `/v1/messages`.
+  - New pure module `lib/agent/toolcall_parse.py` (`extract_tool_calls` + `should_normalize`); handles qwen2.5 JSON-in-content and qwen3-coder XML `<function=>` (the latter retained for ollama versions that still leak it — 0.30.8 emits native structured calls for qwen3-coder + devstral).
+  - **Guards:** parses only when `tool_calls` is empty AND content is present AND tools were requested — never touches the native structured path, idempotent, honors `OPENAI_TOOLS_ENABLED` transitively, fail-open on malformed content. vLLM/MLX paths untouched.
+  - A/B verified live (qwen2.5-coder:32b, ollama 0.30.8): text-in-content `tool_calls=[]` (no-op) → structured `tool_calls` (executes).
+  - **Not** shipped: the standalone port-8765 proxy (a dev shim / SPOF) — only the parse rules graduated.
+
+---
+
 ## [0.21.3] — 2026-06-11 — Close remaining tool silent-drops (`/v1/messages` + vLLM/MLX)
 
 Patch. Closes the last two same-class silent tool-drops left after D094/D098, on code paths an OpenAI-endpoint + Ollama-backend caller never exercises (hence invisible to the original repro but live defects). The originally-reported qcoda symptoms were already fixed on `/v1/chat/completions` as of 0.21.2 — exhaustive prod probing confirmed that AND surfaced these two adjacent gaps.

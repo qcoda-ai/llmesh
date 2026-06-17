@@ -449,6 +449,14 @@ function esc(v) {
         .replace(/'/g, '&#39;');
 }
 
+// Map raw platform.system() values to user-friendly OS labels. Raw os_name
+// (e.g. "Darwin" on Mac) stays in the JSON API for machine consumers; this
+// only prettifies the human dashboard badge.
+function osLabel(v) {
+    const map = { Darwin: 'macOS', Linux: 'Linux', Windows: 'Windows' };
+    return map[v] || v || '';
+}
+
 // ───────── Node table ─────────
 let currentNodes = [];
 let nodeRatings = {};
@@ -531,7 +539,7 @@ function updateNodeTable(nodes) {
                  data-bs-toggle="collapse" data-bs-target="#${collapseId}">
                 <span class="status-dot ${dotClass}"></span>
                 <span class="monospace text-muted" style="min-width:80px;font-size:0.8rem">${esc(n.node_id)}</span>
-                <span class="badge bg-secondary">${esc(n.os_name)}</span>
+                <span class="badge bg-secondary">${esc(osLabel(n.os_name))}</span>
                 <span class="badge ${n.agent_version === n.hub_version ? 'bg-success-subtle text-success-emphasis' : 'bg-secondary-subtle text-secondary-emphasis'}"
                       title="agent ${esc(n.agent_version)} vs hub ${esc(n.hub_version)}">v${esc(n.agent_version || '0.1x')}</span>
                 <span class="text-muted small">${Number(n.cpu_cores) || 0}c&nbsp;/&nbsp;${Number(n.ram_gb) || 0}GB</span>

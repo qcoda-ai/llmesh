@@ -103,6 +103,7 @@ from lib.agent.streaming_batcher import (
     StreamBatcherAborted,
     resolve_batcher_config,
 )
+from lib.agent.toolcall_parse import extract_tool_calls, should_normalize
 
 
 class _StreamCancelled(Exception):
@@ -764,6 +765,18 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
     delta_count = 0
     captured_tool_calls: list = []
     captured_thinking_parts: list[str] = []
+    # D101 — streaming text-form tool-call normalization (qwen2.5-coder leaks
+    # its JSON call into streamed content; Verified 2026-06-16 ollama 0.30.8).
+    # When tools were requested and the model has NOT emitted a native call, we
+    # may need to suppress raw-JSON content deltas and inject a structured call
+    # at stream end. Classifying heuristic: a text-form call's first
+    # non-whitespace char is '{' (qwen2.5 JSON) or '<' (qwen3 XML); prose is
+    # streamed live (one-token lag). `buffering`: None=undecided, True=hold,
+    # False=stream live. Prose detection keeps token streaming intact when no
+    # tool call is forming.
+    tools_requested = bool(task.get("tools"))
+    parse_buffer: list[str] = []
+    buffering = None
 
     async def _post_chunk(chunk_text: str, *, done: bool,
                           prompt_tokens: int = 0, completion_tokens: int = 0,
@@ -854,7 +867,36 @@ async def _run_streaming_ollama(client: httpx.AsyncClient, state: AppState, task
                 if not token:
                     continue
                 delta_count += 1
+                # D101 — hold possible text-form tool-call content for end-of-
+                # stream classification; stream prose live. Native structured
+                # calls (captured_tool_calls set) carry empty content, so this
+                # never engages for the qwen3-coder/devstral path.
+                if tools_requested and not captured_tool_calls:
+                    parse_buffer.append(token)
+                    if buffering is None:
+                        head = "".join(parse_buffer).lstrip()
+                        if head:
+                            buffering = head[0] in "{<"
+                    if buffering is False:
+                        # decided prose — release the held prefix and live-stream
+                        await batcher.add("".join(parse_buffer))
+                        parse_buffer.clear()
+                    continue
                 await batcher.add(token)
+
+        # D101 — stream ended: classify any held content. If it parses as a
+        # text-form tool call, inject the structured call (content suppressed,
+        # same as the native qwen3-coder streaming path); otherwise it was prose
+        # we held back — deliver it. extract_tool_calls is pure + fail-open.
+        if parse_buffer and not captured_tool_calls:
+            buffered = "".join(parse_buffer)
+            parsed = extract_tool_calls(buffered)
+            if parsed:
+                captured_tool_calls.extend(parsed)
+                logger.info("🔧 [%s] D101: parsed %d text-form tool_call(s) from streamed content", task_id, len(parsed))
+            else:
+                await batcher.add(buffered)
+        parse_buffer = []
 
         # Ollama always emits usage on done; if it somehow didn't, fall through
         # to delta_count estimation for symmetry with vLLM/MLX.
@@ -1494,6 +1536,24 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
                 # branch populates). vLLM emits OpenAI-shape tool_calls;
                 # reasoning_content present on reasoning models (DeepSeek-style).
                 tool_calls = resp_msg.get("tool_calls") or []
+                # D101 follow-up — vLLM-served qwen2.5-coder-7b leaks its tool
+                # call as TEXT in content (json/<json>/<response> wrappers) with
+                # tool_calls=[] and finish_reason=stop, because the prod vLLM is
+                # an older build run WITHOUT a working tool-call parser (hermes
+                # does not parse the Coder variant's output — vLLM #29192). The
+                # ollama path (D101) and the vLLM *streaming* path already
+                # normalize; this non-stream branch was the lone hole. Same
+                # guard + parser: only fires when tools were requested, NO native
+                # structured call present, content non-empty — so native vLLM
+                # tool_calls pass through untouched and the fix is idempotent if
+                # the server is ever upgraded to parse natively. Baseline 3/3
+                # text-leak verified live 2026-06-17 against mesh prod.
+                if should_normalize(tool_calls, output_text, bool(task.get("tools"))):
+                    parsed = extract_tool_calls(output_text)
+                    if parsed:
+                        tool_calls = parsed
+                        output_text = ""  # mirror proxy _normalize (content=None)
+                        logger.info("🔧 [%s] D101: parsed %d text-form tool_call(s) from %s content", task_id, len(parsed), backend)
                 reasoning_content = resp_msg.get("reasoning_content") or ""
                 usage = data.get("usage", {})
                 p_tokens = usage.get("prompt_tokens", 0)
@@ -1532,6 +1592,20 @@ async def _run_single_task(client: httpx.AsyncClient, state: AppState, task: dic
                 # so the hub's stored result is a real string (D025 sibling).
                 output_text = msg.get("content") or ""
                 tool_calls = msg.get("tool_calls") or []
+                # D101 — qwen-family text-form tool calls. ollama leaves
+                # qwen2.5-coder calls as TEXT in content (JSON object) with
+                # tool_calls=[]; strict clients then no-op. Parse + inject the
+                # structured call so they execute. Guards (R4): only when tools
+                # were requested, NO native structured call present, content
+                # non-empty — protects the native path (qwen3-coder/devstral
+                # emit structured tool_calls; Verified 2026-06-16 ollama 0.30.8)
+                # and is idempotent. Parser is fail-open (never raises).
+                if should_normalize(tool_calls, output_text, bool(task.get("tools"))):
+                    parsed = extract_tool_calls(output_text)
+                    if parsed:
+                        tool_calls = parsed
+                        output_text = ""  # mirror proxy _normalize (content=None)
+                        logger.info("🔧 [%s] D101: parsed %d text-form tool_call(s) from content", task_id, len(parsed))
                 # D-010 Phase 3 — gpt-oss harmony `analysis` channel arrives
                 # in message.thinking on Ollama 0.30.7 (Phase 0 verified).
                 reasoning_content = msg.get("thinking") or ""
