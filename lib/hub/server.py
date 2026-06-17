@@ -287,6 +287,25 @@ def _node_has_model(n, model: str) -> bool:
     )
 
 
+def _resolve_backend(n, model: str) -> str:
+    """D106 — resolve which backend a node will actually use for `model`.
+
+    MUST mirror the agent's selection precedence in
+    `lib/agent/client.py::_run_single_task` (vllm → mlx → llamacpp → ollama,
+    ollama last as the fallback). A model present in several lists routes to
+    the FIRST match in that order — so a model in both `vllm_models` and
+    `ollama_models` is served by vLLM, not Ollama. The tool-support guard
+    depends on matching the agent's real choice, not a convenient one.
+    """
+    if model in getattr(n.resources, "vllm_models", []):
+        return "vllm"
+    if model in getattr(n.resources, "mlx_models", []):
+        return "mlx"
+    if model in getattr(n.resources, "llamacpp_models", []):
+        return "llamacpp"
+    return "ollama"
+
+
 def _node_has_embedding_model(n, model: str) -> bool:
     """D028: embedding routing is gated on `embedding_models` only. A chat-only
     model in `ollama_models` does not qualify, even if Ollama would accept the
@@ -1157,6 +1176,39 @@ async def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskR
         task.stream = True
         task.stream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
 
+    # D106 — tool-support guard. The vLLM/MLX/llama.cpp *streaming* agent paths
+    # build the upstream body WITHOUT `tools` (lib/agent/client.py:
+    # `_run_streaming_vllm` / `_run_streaming_openai`), so a streaming request
+    # with tools routed to one of those backends silently drops the schema and
+    # the model replies with plain prose — exactly the no-op D105 was meant to
+    # end on the request side. Non-streaming forwards tools on every backend
+    # (D099/D102), and Ollama forwards on both paths (D094). So the only
+    # silent-drop surface is: tools + streaming + non-Ollama backend. Reject it
+    # loudly (400) instead of returning a useless completion. Backend is
+    # resolved with the agent's exact precedence (see `_resolve_backend`).
+    # Known false-reject edge: if an operator disabled that backend's streaming
+    # (VLLM/MLX/LLAMACPP_STREAMING_ENABLED=false) the agent would fall back to
+    # non-streaming and tools WOULD work — the hub can't see the agent's env,
+    # and streaming is ON by default, so we reject. Caller can drop `stream` or
+    # pin an Ollama-served model. Deeper fix (forward + normalize tool_calls on
+    # the streaming paths) tracked as the D106 follow-up.
+    if req.tools and task.stream:
+        backend = _resolve_backend(selected_node, req.model)
+        if backend != "ollama":
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {
+                    "message": (
+                        f"Tool calling is not supported on the streaming '{backend}' "
+                        f"backend serving model '{req.model}'. Send the request "
+                        f"non-streaming (stream=false), or use an Ollama-served model "
+                        f"for streaming tool calls."
+                    ),
+                    "type": "backend_does_not_support_tools",
+                    "param": "tools",
+                }},
+            )
+
     await tasks.queue_task_for_node(selected_node.node_id, task)
 
     logger.info("Routed task %s to node %s using model %s stream=%s", task_id, selected_node.node_id, req.model, task.stream)
@@ -1859,6 +1911,13 @@ async def _process_chat_completion(
         node_id = task_response.node_assigned
         task_id = task_response.task_id
     except HTTPException as e:
+        # D106 — a 400 from _route_inference carries a structured `detail` dict
+        # (the tool-support guard) and must reach the client as a 400, not be
+        # masked as a 503. Everything else (e.g. 503 no-capable-node) keeps the
+        # server-error envelope.
+        if e.status_code == 400:
+            content = e.detail if isinstance(e.detail, dict) else {"error": {"message": e.detail, "type": "invalid_request_error"}}
+            return None, JSONResponse(status_code=400, content=content), session_id, owner_id, stored_history, messages
         return None, JSONResponse(status_code=503, content={"error": {"message": e.detail, "type": "server_error"}}), session_id, owner_id, stored_history, messages
 
     queued_task = tasks.get_task_status(node_id, task_id)

@@ -12,6 +12,13 @@ _Nothing yet._
 
 ---
 
+## [0.22.2] — 2026-06-17 — Loud 400 for tools on streaming non-Ollama backends
+
+### Fixed
+- **Tool calls no longer silently dropped on streaming vLLM/MLX/llama.cpp (D106).** The vLLM/MLX/llama.cpp *streaming* agent paths build the upstream request without `tools`, so a streaming request carrying tools routed to one of those backends used to return a plain prose completion with no error. The hub now returns `400 backend_does_not_support_tools` (structured, names the backend) instead, telling the caller to send the request non-streaming or use an Ollama-served model. Non-streaming tool calls work on every backend (D099/D102) and Ollama works on both paths (D094) — those are unaffected. Backend is resolved with the agent's exact precedence (vLLM → MLX → llama.cpp → Ollama). Together with D105 this makes the tool path either work or fail loudly, never silently no-op. (`lib/hub/server.py`)
+
+---
+
 ## [0.22.1] — 2026-06-17 — `/v1/messages` accepts Anthropic content-block arrays
 
 ### Fixed
