@@ -659,6 +659,99 @@ def test_anthropic_wire_unknown_block_skipped_not_rejected():
     assert out == [{"role": "user", "content": "what is this"}]
 
 
+# --- D108: system field + structured drop warnings (gap-fill on D105) ---
+
+
+def test_anthropic_wire_image_block_logs_and_drops(caplog):
+    """D108 — image blocks drop with a structured warning naming the type."""
+    with caplog.at_level("WARNING", logger="llmesh.hub"):
+        out = server._anthropic_messages_to_wire([_Msg("user", [
+            {"type": "image", "source": {"type": "base64", "data": "..."}},
+            {"type": "text", "text": "what is this"},
+        ])])
+    assert out == [{"role": "user", "content": "what is this"}]
+    assert any("image" in r.message for r in caplog.records), caplog.text
+
+
+def test_anthropic_wire_unknown_block_logs_type(caplog):
+    """D108 — unknown block types drop with a warning naming the type, never 422."""
+    with caplog.at_level("WARNING", logger="llmesh.hub"):
+        out = server._anthropic_messages_to_wire([_Msg("user", [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "text", "text": "hi"},
+        ])])
+    assert out == [{"role": "user", "content": "hi"}]
+    assert any("thinking" in r.message for r in caplog.records), caplog.text
+
+
+def _install_system_capturing_route(monkeypatch, captured):
+    """Shared fake route that records the wire messages it receives."""
+    async def _capturing_route(req, stream=False):
+        captured["messages"] = req.messages
+        from lib.hub import tasks as ht
+        task = ht.Task(task_id="t-d108", kind=ht.TaskKind.CHAT, model=req.model,
+                       owner_id=req.owner_id, messages=req.messages)
+        task.status = "completed"
+        task.result = "ok"
+        task.done_event.set()
+        ht._task_index[task.task_id] = task
+        ht._node_tasks.setdefault("fake-node", []).append(task)
+        return server.TaskResponse(task_id=task.task_id, node_assigned="fake-node",
+                                   status="completed", model=req.model)
+
+    from lib.hub import storage as _storage
+    monkeypatch.setattr(server, "OPENAI_TOOLS_ENABLED", True)
+    monkeypatch.setattr(_storage, "authenticate_owner",
+                        lambda k: "o" if k == "my_secret_key_1" else None)
+    monkeypatch.setattr(server, "_route_inference", _capturing_route)
+
+
+def test_anthropic_messages_system_string_prepended(client, monkeypatch):
+    """D108 — a string `system` becomes the leading upstream system turn."""
+    captured = {}
+    _install_system_capturing_route(monkeypatch, captured)
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "qwen2.5-coder:32b", "max_tokens": 64,
+        "system": "You are a terse assistant.",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200, resp.text
+    wire = captured["messages"]
+    assert wire[0] == {"role": "system", "content": "You are a terse assistant."}, wire
+
+
+def test_anthropic_messages_system_array_flattened(client, monkeypatch):
+    """D108 — a `system` block array (the Claude Code shape, with cache_control)
+    flattens to one system turn; cache_control is stripped."""
+    captured = {}
+    _install_system_capturing_route(monkeypatch, captured)
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "qwen2.5-coder:32b", "max_tokens": 64,
+        "system": [
+            {"type": "text", "text": "You are Claude Code."},
+            {"type": "text", "text": "Be brief.",
+             "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200, resp.text
+    wire = captured["messages"]
+    assert wire[0] == {"role": "system",
+                       "content": "You are Claude Code.\nBe brief."}, wire
+
+
+def test_anthropic_messages_no_system_unchanged(client, monkeypatch):
+    """D108 regression — omitting `system` adds no leading system turn."""
+    captured = {}
+    _install_system_capturing_route(monkeypatch, captured)
+    resp = client.post("/v1/messages", headers={"x-api-key": "my_secret_key_1"}, json={
+        "model": "qwen2.5-coder:32b", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200, resp.text
+    assert all(m.get("role") != "system" for m in captured["messages"]), captured["messages"]
+
+
 def test_anthropic_messages_block_array_returns_200_not_422(client, monkeypatch):
     """Gate A — the exact Claude Code repro (block-array content, cache_control)
     must reach inference and return 200, not 422."""

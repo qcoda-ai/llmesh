@@ -2,6 +2,7 @@ import logging
 import time
 import uuid
 import os
+import random
 import secrets
 from collections import OrderedDict
 from typing import Dict, Any, List, Optional, Union
@@ -202,6 +203,13 @@ class AnthropicMessage(BaseModel):
 class AnthropicRequest(BaseModel):
     model: str
     messages: List[AnthropicMessage]
+    # D108 — `system` is a top-level field (NOT a message), shaped `str | list[text-block]`
+    # per the Anthropic Messages API. D105 added block-array message support but omitted
+    # `system` from this model, so it was silently dropped — Claude Code's entire system
+    # prompt vanished before inference. Accepted as str OR opaque block list; flattened
+    # and prepended as the upstream system turn in the handler. cache_control on a system
+    # block is ignored (same as message blocks).
+    system: Optional[Union[str, List[Dict[str, Any]]]] = None
     max_tokens: int = 1024 # Default for Anthropic API
     stream: bool = False # Not supported yet
     num_ctx: Optional[int] = None
@@ -247,6 +255,44 @@ OPENAI_TOOLS_ENABLED = os.getenv("OPENAI_TOOLS_ENABLED", "true").lower() in ("1"
 # fully saturated CPU costs ~10 GB. Both env-tunable.
 ROUTING_QUEUE_PENALTY = float(os.getenv("ROUTING_QUEUE_PENALTY", "8.0"))
 ROUTING_CPU_PENALTY   = float(os.getenv("ROUTING_CPU_PENALTY",   "0.1"))
+
+# Perf-aware weighted-random routing (D107, extends D054 for the CHAT path).
+# The legacy RAM-base sort (above) ties when nodes have equal RAM and the
+# queue drains to 0 between serial requests, so chat traffic deterministically
+# sticks to one node — often the slower one (D107 §root-cause). For chat we
+# instead score each node by its rolling tokens/sec EWMA for the requested
+# model and pick PROBABILISTICALLY (random.choices weighted by score**BETA):
+# the faster node is FAVORED, not monopolised. Embedding/image keep the legacy
+# deterministic RAM argmax. Disable via ROUTING_PERF_AWARE=false for instant
+# rollback to pure-RAM scoring with no redeploy.
+#   weight(node) = max(perf_tok_s - queue*QUEUE - cpu*CPU, FLOOR) ** BETA
+#   PERF_DEFAULT is a huge cold-start prior so an unsampled (node,model) is
+#   explored first, then settles to its measured rate via the EWMA.
+ROUTING_PERF_AWARE         = os.getenv("ROUTING_PERF_AWARE", "true").lower() in ("1", "true", "yes")
+ROUTING_PERF_QUEUE_PENALTY = float(os.getenv("ROUTING_PERF_QUEUE_PENALTY", "10.0"))
+ROUTING_PERF_CPU_PENALTY   = float(os.getenv("ROUTING_PERF_CPU_PENALTY",   "0.02"))
+ROUTING_PERF_FLOOR         = float(os.getenv("ROUTING_PERF_FLOOR",         "0.1"))
+ROUTING_PERF_BETA          = float(os.getenv("ROUTING_PERF_BETA",          "1.0"))
+ROUTING_PERF_DEFAULT       = float(os.getenv("ROUTING_PERF_DEFAULT",       "1e6"))
+ROUTING_PERF_EWMA_ALPHA    = float(os.getenv("ROUTING_PERF_EWMA_ALPHA",    "0.3"))
+
+# Rolling tokens/sec EWMA keyed by (node_id, model). Populated on every
+# successful chat completion in `_emit_inference_event`; read on the routing
+# hot path with no DB round-trip. Stale entries for offline nodes are
+# harmless — the EWMA re-adapts when the node returns.
+_node_perf: "dict[tuple[str, str], float]" = {}
+
+
+def _record_node_perf(node_id: str, model: str, duration_ms: float, completion_tokens: int) -> None:
+    """Fold one completed chat inference into the (node,model) tokens/sec EWMA
+    (D107). No-op when there is nothing to measure (zero tokens / duration)."""
+    if duration_ms <= 0 or completion_tokens <= 0:
+        return
+    tok_s = completion_tokens / (duration_ms / 1000.0)
+    key = (node_id, model)
+    prev = _node_perf.get(key)
+    a = ROUTING_PERF_EWMA_ALPHA
+    _node_perf[key] = tok_s if prev is None else (1 - a) * prev + a * tok_s
 
 DEFAULT_CONTEXT_WINDOW = os.getenv("DEFAULT_CONTEXT_WINDOW")
 if DEFAULT_CONTEXT_WINDOW:
@@ -403,16 +449,48 @@ def _score_node(node) -> float:
     idle. Computed from in-memory state only — no DB read, no heartbeat
     round-trip. Tunable via ROUTING_QUEUE_PENALTY / ROUTING_CPU_PENALTY.
     """
-    queue_depth = sum(
-        1 for t in tasks.get_tasks_for_node(node.node_id)
-        if t.status in ("pending", "claimed")
-    )
     cpu_load = getattr(node, "cpu_load", 0.0) or 0.0
     return (
         node.resources.ram_gb
-        - queue_depth * ROUTING_QUEUE_PENALTY
-        - cpu_load    * ROUTING_CPU_PENALTY
+        - _node_queue_depth(node) * ROUTING_QUEUE_PENALTY
+        - cpu_load                * ROUTING_CPU_PENALTY
     )
+
+
+def _node_queue_depth(node) -> int:
+    """In-flight task count for a node (pending + claimed) — in-memory, no DB."""
+    return sum(
+        1 for t in tasks.get_tasks_for_node(node.node_id)
+        if t.status in ("pending", "claimed")
+    )
+
+
+def _perf_weight(node, model: str) -> float:
+    """Selection weight for the perf-aware chat path (D107). Base is the
+    node's rolling tokens/sec EWMA for `model` (cold start → PERF_DEFAULT so
+    untested nodes are explored first), penalised by queue depth and CPU load,
+    floored so a busy/slow node keeps a small non-zero chance, then raised to
+    BETA to tune greediness (1.0 = proportional, 0 = uniform, higher = greedier)."""
+    base    = _node_perf.get((node.node_id, model), ROUTING_PERF_DEFAULT)
+    cpu_load = getattr(node, "cpu_load", 0.0) or 0.0
+    score = (
+        base
+        - _node_queue_depth(node) * ROUTING_PERF_QUEUE_PENALTY
+        - cpu_load                * ROUTING_PERF_CPU_PENALTY
+    )
+    return max(score, ROUTING_PERF_FLOOR) ** ROUTING_PERF_BETA
+
+
+def _pick_perf_weighted(candidates, model: str):
+    """Probabilistically pick one node, favouring higher tokens/sec without
+    monopolising it (D107). Returns the single best node when there is no
+    randomness to apply."""
+    if len(candidates) == 1:
+        return candidates[0]
+    weights = [_perf_weight(n, model) for n in candidates]
+    if sum(weights) <= 0:                      # degenerate — all floored to 0**BETA
+        return max(candidates, key=lambda n: _perf_weight(n, model))
+    return random.choices(candidates, weights=weights, k=1)[0]
 
 
 async def _try_requeue(task: tasks.Task) -> bool:
@@ -430,8 +508,11 @@ async def _try_requeue(task: tasks.Task) -> bool:
     ]
     if not candidates:
         return False
-    candidates.sort(key=_score_node, reverse=True)
-    selected = candidates[0]
+    if ROUTING_PERF_AWARE and task.kind == TaskKind.CHAT:
+        selected = _pick_perf_weighted(candidates, task.model)
+    else:
+        candidates.sort(key=_score_node, reverse=True)
+        selected = candidates[0]
     task.attempted_nodes.add(selected.node_id)
     await tasks.requeue_task(task, selected.node_id)
     logger.info("Requeued task %s → node %s (retries_left=%s)", task.task_id, selected.node_id, task.retries_left)
@@ -709,7 +790,19 @@ def _anthropic_messages_to_wire(messages: list) -> list[dict]:
                     "tool_call_id": block.get("tool_use_id", ""),
                     "content": body,
                 })
-            # unknown block types (image, future) are skipped for forward-compat
+            elif btype == "image":
+                # D108 — vision pass-through is out of scope; drop with a structured
+                # warning naming the type rather than silently swallowing it.
+                logger.warning(
+                    "anthropic /v1/messages: dropping `image` block — upstream image "
+                    "pass-through not implemented (vision out of scope, D108)"
+                )
+            else:
+                # D108 — unknown/future block types degrade (drop + warn), never 422.
+                logger.warning(
+                    "anthropic /v1/messages: dropping unsupported content block type=%r",
+                    btype,
+                )
 
         # tool_result turns become standalone tool messages (must precede any
         # trailing user text so the OpenAI ordering invariant holds).
@@ -1117,11 +1210,18 @@ async def list_nodes(request: Request, authorization: str | None = Header(None))
         raise HTTPException(status_code=403, detail="Invalid API key")
     return [n for n in storage.get_all_nodes() if n.owner_id == owner_id]
 
-def _select_node(owner_id: str, model: str, has_model_predicate) -> "Node | None":
-    """Find the best currently-online node for an owner+model pair, using the
-    given capability predicate. Sorted by `_score_node` desc — weighted by
-    queue depth and CPU load so the highest-RAM node does not capture every
-    request while peers sit idle (D054 closes D036 §1)."""
+def _select_node(owner_id: str, model: str, has_model_predicate, perf_aware: bool = False) -> "Node | None":
+    """Find an online node for an owner+model pair using the given capability
+    predicate.
+
+    Two modes:
+      * Legacy (perf_aware=False) — deterministic `_score_node` argmax,
+        weighted by RAM/queue/CPU (D054, closes D036 §1). Used for embedding
+        and image routing.
+      * Perf-aware (perf_aware=True) — weighted-RANDOM pick favouring the
+        node with the highest tokens/sec for `model`, so the fastest node is
+        favoured but not monopolised (D107). Used for chat. Honoured only
+        when ROUTING_PERF_AWARE is set; otherwise falls back to legacy."""
     all_nodes = storage.get_all_nodes()
     current_time = time.time()
     capable = [
@@ -1133,13 +1233,15 @@ def _select_node(owner_id: str, model: str, has_model_predicate) -> "Node | None
     ]
     if not capable:
         return None
+    if perf_aware and ROUTING_PERF_AWARE:
+        return _pick_perf_weighted(capable, model)
     capable.sort(key=_score_node, reverse=True)
     return capable[0]
 
 
 async def _route_inference(req: InferenceRequest, stream: bool = False) -> TaskResponse:
     """Internal routing — owner_id must already be validated before calling."""
-    selected_node = _select_node(req.owner_id, req.model, _node_has_model)
+    selected_node = _select_node(req.owner_id, req.model, _node_has_model, perf_aware=True)
     if selected_node is None:
         raise HTTPException(status_code=503, detail=f"No capable nodes currently online with model {req.model}")
 
@@ -1561,6 +1663,12 @@ def _bridge_blocking_completion_to_stream_consumer(task: tasks.Task, *, error: b
 
 def _emit_inference_event(task: tasks.Task, node_id: str, duration_ms: float,
                           result: dict, status: str):
+    # Feed perf-aware chat routing (D107): fold this completion's tokens/sec
+    # into the (node,model) EWMA the weighted picker reads. Chat-only and
+    # success-only — failures/embeddings/images carry no meaningful gen rate.
+    if status == "success" and task.kind is tasks.TaskKind.CHAT:
+        _record_node_perf(node_id, task.model, duration_ms,
+                          result.get("completion_tokens", 0) or 0)
     metrics.log_inference_event(
         user_id=task.owner_id,
         node_id=node_id,
@@ -2127,6 +2235,13 @@ async def anthropic_messages(
     # tool_use/tool_result map to the agentic-loop wire shape, cache_control is
     # ignored. String content is untouched (no regression on plain requests).
     messages = _anthropic_messages_to_wire(req.messages)
+    # D108 — flatten the top-level `system` field (str | list[text-block]) and prepend it
+    # as the upstream OpenAI system turn. D105 left this off the request model, so the
+    # system prompt was silently dropped. `_anthropic_block_text` handles both shapes
+    # (string passthrough; list → join of `text` blocks, cache_control ignored).
+    system_text = _anthropic_block_text(req.system) if req.system is not None else ""
+    if system_text:
+        messages = [{"role": "system", "content": system_text}] + messages
     # D099 — forward tools/tool_choice through the same hub-enforced pipeline as
     # the OpenAI endpoint. Previously dropped here: the model never saw the tool
     # schema, so /v1/messages silently emitted 0 tool calls (same bug class as

@@ -12,6 +12,13 @@ _Nothing yet._
 
 ---
 
+## [0.22.4] — 2026-06-21 — `/v1/messages` honors `system` + warns on dropped blocks
+
+### Fixed
+- **`/v1/messages` no longer silently drops the top-level `system` prompt (D108).** D105 added content-block array support on `messages[].content` but omitted the Anthropic API's top-level `system` field (`str | list[text-block]`) from the request model, so it was ignored entirely — the hub returned 200 but the model never saw the system instructions Claude Code sends on every call. `system` is now accepted in both shapes, flattened (cache_control stripped), and prepended as the upstream system turn. Dropped `image`/unknown blocks now emit a structured warning naming the type instead of being silently skipped. Completes the D105 spec; sibling of D101 (response-side tool-call normalization, reused unchanged). (`lib/hub/server.py`)
+
+---
+
 ## [0.22.2] — 2026-06-17 — Loud 400 for tools on streaming non-Ollama backends
 
 ### Fixed

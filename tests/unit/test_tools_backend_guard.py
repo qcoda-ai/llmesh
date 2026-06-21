@@ -54,7 +54,7 @@ def _req(model, *, tools=None):
 
 
 def _route(req, node, stream, monkeypatch):
-    monkeypatch.setattr(server, "_select_node", lambda owner, model, pred: node)
+    monkeypatch.setattr(server, "_select_node", lambda owner, model, pred, perf_aware=False: node)
 
     async def _noop_queue(node_id, task):
         return None
@@ -99,7 +99,7 @@ def test_guard_400_surfaces_through_process_chat_completion(monkeypatch):
     not be masked as 503 by the generic HTTPException handler."""
     node = _node(vllm=["coder"])
     monkeypatch.setattr(server.storage, "authenticate_owner", lambda k: "o")
-    monkeypatch.setattr(server, "_select_node", lambda owner, model, pred: node)
+    monkeypatch.setattr(server, "_select_node", lambda owner, model, pred, perf_aware=False: node)
 
     async def _noop_queue(node_id, task):
         return None
